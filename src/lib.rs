@@ -6,6 +6,7 @@
 //!   CCSDS de-randomization → Reed-Solomon → CRC-32C → CSP payload
 
 pub mod audio;
+pub mod audio_check;
 pub mod dsp;
 pub mod error;
 pub mod fec;

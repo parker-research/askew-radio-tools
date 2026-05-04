@@ -5,7 +5,7 @@
 //!
 //! Outputs decoded CSP packet payload bytes (hex) for each valid frame found.
 use anyhow::{Context, Result};
-use ax100_radio_csp_decoder::{audio, dsp, fec, framing};
+use ax100_radio_csp_decoder::{audio, audio_check, dsp, fec, framing};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -36,7 +36,26 @@ fn main() -> Result<()> {
         audio.samples_per_symbol()
     );
 
-    // 2. DSP front-end: FM discriminator → LPF → Gardner TED → slicer
+    // 2. Audio quality pre-check
+    println!("\nRunning audio quality check...");
+    let metrics = audio_check::check(&audio);
+    println!("  Duration:          {:.2} s", metrics.duration_secs);
+    println!("  RMS level:         {:.4}", metrics.rms_level);
+    println!(
+        "  Clipping:          {:.2}%",
+        metrics.clipping_fraction * 100.0
+    );
+    println!("  In-band power:     {:.1} dBFS", metrics.inband_power_db);
+    println!("  Guard-band power:  {:.1} dBFS", metrics.guard_power_db);
+    println!("  Estimated SNR:     {:.1} dB", metrics.estimated_snr_db);
+    println!("  Verdict:           {}", metrics.verdict);
+
+    if !metrics.verdict.is_ok() {
+        eprintln!("\nAudio pre-check failed — aborting decode.");
+        std::process::exit(2);
+    }
+
+    // 3. DSP front-end: FM discriminator → LPF → Gardner TED → slicer
     println!("\nRunning DSP front-end...");
     let bitstream = dsp::fm_discriminate_and_filter(&audio);
     println!(
@@ -45,7 +64,7 @@ fn main() -> Result<()> {
         bitstream.recovered_symbol_rate,
     );
 
-    // 3. Sync word search + frame extraction
+    // 4. Sync word search + frame extraction
     println!("\nSearching for frames...");
     let frames = framing::find_frames(&bitstream.bits);
     println!("  Found {} candidate frame(s)", frames.len());
@@ -55,7 +74,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 4. Process each frame through FEC pipeline
+    // 5. Process each frame through FEC pipeline
     let mut valid = 0usize;
     for (idx, frame) in frames.iter().enumerate() {
         println!(
@@ -76,10 +95,10 @@ fn main() -> Result<()> {
             data.truncate(rs_len);
         }
 
-        // 4a. CCSDS de-randomize
+        // 5a. CCSDS de-randomize
         fec::ccsds_derandomize(&mut data);
 
-        // 4b. Reed-Solomon decode
+        // 5b. Reed-Solomon decode
         let rs_result = fec::rs_decode(&data);
         let rs_data = match rs_result {
             Ok(d) => d,
@@ -93,7 +112,7 @@ fn main() -> Result<()> {
             rs_data.len()
         );
 
-        // 4c. CRC-32C verify
+        // 5c. CRC-32C verify
         let payload = match fec::crc32c_verify_and_strip(&rs_data) {
             Ok(p) => p,
             Err(e) => {
