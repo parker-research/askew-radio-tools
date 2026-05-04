@@ -2,5 +2,16 @@
 name = "ax100-radio-csp-decoder"
 version = "0.1.0"
 edition = "2024"
+description = "AX100 satellite beacon decoder for SatNOGS audio"
 
 [dependencies]
+symphonia = { version = "0.5", features = ["wav", "ogg", "vorbis"] }
+num-complex = "0.4"
+biquad = "0.4"
+bitvec = "1"
+crc32c = "0.6"
+thiserror = "1"
+anyhow = "1"
+
+[dev-dependencies]
+rand = "0.8"
