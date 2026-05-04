@@ -4,18 +4,20 @@
 //!   decode <audio_file.wav|.ogg>
 //!
 //! Outputs decoded CSP packet payload bytes (hex) for each valid frame found.
-
 use anyhow::{Context, Result};
 use ax100_radio_csp_decoder::{audio, dsp, fec, framing};
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(about = "AX100 beacon decoder")]
+struct Cli {
+    /// Audio file to decode (.wav or .ogg)
+    audio_file: String,
+}
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <audio_file.wav|.ogg>", args[0]);
-        std::process::exit(1);
-    }
-
-    let path = &args[1];
+    let cli = Cli::parse();
+    let path = &cli.audio_file;
     println!("Loading audio: {}", path);
 
     // 1. Load audio
