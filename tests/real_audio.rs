@@ -61,26 +61,48 @@ fn test_satnogs_observation_14813295_decodes_at_least_10_good_frames() {
 
     let records = pipeline::decode_file(path_str).expect("pipeline should run without error");
 
-    let good: Vec<_> = records.iter().filter(|r| r.crc_pass).collect();
+    // "Good" requires RS correctability, and no *explicit* CRC failure
+    // (crc_pass: Some(false)) — a frame with no CRC field at all
+    // (crc_pass: None) doesn't count against it, since there's nothing to
+    // have failed. RS correctability is what actually establishes the
+    // frame is real; CRC alone isn't a reliable signal on its own, since a
+    // noise-driven RS-uncorrectable frame can still hit a matching CRC (or
+    // lack one) by chance.
+    let good: Vec<_> = records
+        .iter()
+        .filter(|r| r.rs_correctable && r.crc_pass != Some(false))
+        .collect();
+    let rs_uncorrectable: Vec<_> = records.iter().filter(|r| !r.rs_correctable).collect();
     let bad_count = records.len() - good.len();
 
     eprintln!(
-        "decoded {} frame(s) total: {} good (CRC pass), {} bad (CRC fail)",
+        "decoded {} frame(s) total: {} good (RS-correctable + CRC pass), {} bad, {} RS-uncorrectable",
         records.len(),
         good.len(),
-        bad_count
+        bad_count,
+        rs_uncorrectable.len()
     );
     for r in &good {
         eprintln!(
-            "  t={:>9.1}ms  {}B  rs_corrected={}  {}",
+            "  t={:>9.1}ms  {}B  rs_corrected={:?}  {}",
             r.time_in_file_ms, r.data_length_bytes, r.rs_corrected_error_count, r.data_hex
         );
     }
 
     assert!(
         good.len() >= 10,
-        "expected at least 10 good (RS + CRC passing) frames, got {} (out of {} total)",
+        "expected at least 10 good (RS-correctable + CRC passing) frames, got {} (out of {} total)",
         good.len(),
         records.len()
+    );
+
+    // The whole point of keeping RS-uncorrectable frames in the output
+    // (rather than silently dropping them) is that a real, noisy capture
+    // like this one should actually produce some — confirm that's true
+    // rather than just trusting the field exists.
+    assert!(
+        !rs_uncorrectable.is_empty(),
+        "expected at least one RS-uncorrectable frame to be present in the output \
+         (this capture is known to contain noise-triggered syncword matches)"
     );
 }

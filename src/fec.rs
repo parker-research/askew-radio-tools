@@ -401,15 +401,35 @@ const HEADER_LEN: usize = 3;
 /// (`packlen=258` in gr-satellites' `sync_to_pdu_packed`).
 pub const ASM_FRAME_LEN_BYTES: usize = HEADER_LEN + NN;
 
+/// Result of decoding one AX100 ASM+Golay frame.
+pub struct AsmGolayDecoded {
+    /// CSP frame bytes (RS parity stripped). Best-effort: if
+    /// `rs_correctable` is `false`, this is the derandomized-but-otherwise-
+    /// uncorrected payload (RS detected more errors than it can fix, so
+    /// any partial corrections it made along the way aren't trustworthy).
+    pub payload: Vec<u8>,
+    /// Number of symbol errors the RS decoder corrected, or `None` if
+    /// `rs_correctable` is `false` (there's no meaningful count when RS
+    /// couldn't actually correct the codeword).
+    pub rs_corrected_error_count: Option<u32>,
+    /// Whether RS decoding succeeded (`false` means the codeword had more
+    /// than 16 symbol errors — uncorrectable).
+    pub rs_correctable: bool,
+}
+
 /// Decode one AX100 ASM+Golay frame (the 258 bytes following the syncword),
 /// mirroring `u482c_decode_impl::msg_handler` with `ax100_deframer`'s fixed
 /// configuration (Viterbi off, RS on, CCSDS scrambler on).
 ///
-/// Returns the recovered CSP frame bytes (RS parity stripped) and the
-/// number of symbol errors the RS decoder corrected.
+/// Returns `Err` only when the frame can't be interpreted at all (the
+/// Golay-coded header itself is uncorrectable, or it decodes to a length
+/// that isn't a valid RS(255,223) pad) — there's no frame length to work
+/// from in that case. An RS-uncorrectable *payload* is still returned as
+/// `Ok` (see [`AsmGolayDecoded::rs_correctable`]), so callers can choose
+/// whether to keep or drop those.
 pub fn ax100_asm_golay_decode(
     frame: &[u8; ASM_FRAME_LEN_BYTES],
-) -> Result<(Vec<u8>, u32), DecodeError> {
+) -> Result<AsmGolayDecoded, DecodeError> {
     let mut header = ((frame[0] as u32) << 16) | ((frame[1] as u32) << 8) | frame[2] as u32;
     golay24_decode(&mut header)?;
 
@@ -434,12 +454,15 @@ pub fn ax100_asm_golay_decode(
 
     let gf = GfTables::new();
     let count = decode_rs8(&gf, &mut packet, pad);
-    if count < 0 {
-        return Err(DecodeError::ReedSolomonFailed);
-    }
+    let rs_correctable = count >= 0;
+    let rs_corrected_error_count = rs_correctable.then_some(count as u32);
 
     let payload_len = frame_len - NROOTS;
-    Ok((packet[..payload_len].to_vec(), count as u32))
+    Ok(AsmGolayDecoded {
+        payload: packet[..payload_len].to_vec(),
+        rs_corrected_error_count,
+        rs_correctable,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -448,24 +471,30 @@ pub fn ax100_asm_golay_decode(
 
 /// Check the CSP CRC on a decoded CSP frame, following the `crc` flag bit
 /// in the CSP header (bit 0 of the big-endian 32-bit header word — see
-/// `python/csp_header.py`'s `CSP.crc`). If the flag is clear there's no
-/// trailer to check, so this returns `true` (nothing failed).
-pub fn csp_crc32c_check(frame: &[u8]) -> bool {
+/// `python/csp_header.py`'s `CSP.crc`).
+///
+/// Returns `None` when there's no CRC to check at all: either the header's
+/// `crc` flag is clear (the frame doesn't include one), or the frame is too
+/// short to even read the 4-byte header and so the flag can't be
+/// determined. Returns `Some(true)`/`Some(false)` when a CRC trailer is
+/// expected and does/doesn't match (including the case where the header
+/// claims one but the frame is too short to actually hold it).
+pub fn csp_crc32c_check(frame: &[u8]) -> Option<bool> {
     if frame.len() < 4 {
-        return false;
+        return None;
     }
     let header = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
     let crc_flag = header & 1 != 0;
     if !crc_flag {
-        return true;
+        return None;
     }
     if frame.len() < 8 {
-        return false;
+        return Some(false);
     }
 
     let (body, crc_bytes) = frame.split_at(frame.len() - 4);
     let stored = u32::from_be_bytes(crc_bytes.try_into().unwrap());
-    crc32c::crc32c(body) == stored
+    Some(crc32c::crc32c(body) == stored)
 }
 
 // ---------------------------------------------------------------------------
@@ -561,10 +590,11 @@ mod tests {
         let seq = ccsds_sequence(255);
         frame[HEADER_LEN..].copy_from_slice(&seq);
 
-        let (payload, corrected) = ax100_asm_golay_decode(&frame).expect("should decode cleanly");
-        assert_eq!(payload.len(), 223);
-        assert!(payload.iter().all(|&b| b == 0));
-        assert_eq!(corrected, 0);
+        let decoded = ax100_asm_golay_decode(&frame).expect("should decode cleanly");
+        assert_eq!(decoded.payload.len(), 223);
+        assert!(decoded.payload.iter().all(|&b| b == 0));
+        assert_eq!(decoded.rs_corrected_error_count, Some(0));
+        assert!(decoded.rs_correctable);
     }
 
     #[test]
@@ -576,16 +606,42 @@ mod tests {
         // Corrupt one transmitted (scrambled) byte inside the codeword.
         frame[HEADER_LEN + 50] ^= 0x5A;
 
-        let (payload, corrected) = ax100_asm_golay_decode(&frame).expect("should correct 1 error");
-        assert!(payload.iter().all(|&b| b == 0));
-        assert_eq!(corrected, 1);
+        let decoded = ax100_asm_golay_decode(&frame).expect("should correct 1 error");
+        assert!(decoded.payload.iter().all(|&b| b == 0));
+        assert_eq!(decoded.rs_corrected_error_count, Some(1));
+        assert!(decoded.rs_correctable);
     }
 
     #[test]
-    fn test_csp_crc_check_no_crc_flag_passes() {
+    fn test_asm_decode_reports_uncorrectable_rs_with_best_effort_payload() {
+        let mut frame = [0u8; ASM_FRAME_LEN_BYTES];
+        frame[..HEADER_LEN].copy_from_slice(&make_header(255));
+        let seq = ccsds_sequence(255);
+        frame[HEADER_LEN..].copy_from_slice(&seq);
+        // Corrupt far more than the 16 symbols RS(255,223) can fix.
+        for i in 0..40 {
+            frame[HEADER_LEN + i] ^= 0x5A;
+        }
+
+        let decoded = ax100_asm_golay_decode(&frame).expect(
+            "Golay header is fine; frame should still decode to Ok with rs_correctable=false",
+        );
+        assert!(!decoded.rs_correctable);
+        assert_eq!(decoded.rs_corrected_error_count, None);
+        assert_eq!(decoded.payload.len(), 223);
+    }
+
+    #[test]
+    fn test_csp_crc_check_no_crc_flag_is_none() {
         // header with crc bit (LSB) = 0
         let frame = [0x00u8, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
-        assert!(csp_crc32c_check(&frame));
+        assert_eq!(csp_crc32c_check(&frame), None);
+    }
+
+    #[test]
+    fn test_csp_crc_check_too_short_for_header_is_none() {
+        let frame = [0x00u8, 0x00, 0x01];
+        assert_eq!(csp_crc32c_check(&frame), None);
     }
 
     #[test]
@@ -595,7 +651,7 @@ mod tests {
         let crc = crc32c::crc32c(&frame);
         frame.extend_from_slice(&crc.to_be_bytes());
 
-        assert!(csp_crc32c_check(&frame));
+        assert_eq!(csp_crc32c_check(&frame), Some(true));
     }
 
     #[test]
@@ -606,6 +662,13 @@ mod tests {
         frame.extend_from_slice(&crc.to_be_bytes());
         *frame.last_mut().unwrap() ^= 0xFF;
 
-        assert!(!csp_crc32c_check(&frame));
+        assert_eq!(csp_crc32c_check(&frame), Some(false));
+    }
+
+    #[test]
+    fn test_csp_crc_check_flag_set_but_no_room_for_trailer() {
+        // crc bit set, but only 4 bytes total (header only, no trailer)
+        let frame = [0x00u8, 0x00, 0x00, 0x01];
+        assert_eq!(csp_crc32c_check(&frame), Some(false));
     }
 }
