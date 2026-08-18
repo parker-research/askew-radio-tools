@@ -21,7 +21,10 @@ pub struct BeaconRecord {
     /// best-effort, likely-still-corrupt payload, kept in the output
     /// rather than dropped so callers can see/inspect what was received.
     pub rs_correctable: bool,
-    pub crc_pass: bool,
+    /// `true`/`false` if the CSP frame's header declares a CRC trailer and
+    /// it matches/doesn't; `None` if the frame doesn't include one (per
+    /// the CSP header's `crc` flag) — there's nothing to check.
+    pub crc_pass: Option<bool>,
     pub data_hex: String,
 }
 

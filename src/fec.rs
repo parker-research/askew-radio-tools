@@ -471,24 +471,30 @@ pub fn ax100_asm_golay_decode(
 
 /// Check the CSP CRC on a decoded CSP frame, following the `crc` flag bit
 /// in the CSP header (bit 0 of the big-endian 32-bit header word — see
-/// `python/csp_header.py`'s `CSP.crc`). If the flag is clear there's no
-/// trailer to check, so this returns `true` (nothing failed).
-pub fn csp_crc32c_check(frame: &[u8]) -> bool {
+/// `python/csp_header.py`'s `CSP.crc`).
+///
+/// Returns `None` when there's no CRC to check at all: either the header's
+/// `crc` flag is clear (the frame doesn't include one), or the frame is too
+/// short to even read the 4-byte header and so the flag can't be
+/// determined. Returns `Some(true)`/`Some(false)` when a CRC trailer is
+/// expected and does/doesn't match (including the case where the header
+/// claims one but the frame is too short to actually hold it).
+pub fn csp_crc32c_check(frame: &[u8]) -> Option<bool> {
     if frame.len() < 4 {
-        return false;
+        return None;
     }
     let header = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
     let crc_flag = header & 1 != 0;
     if !crc_flag {
-        return true;
+        return None;
     }
     if frame.len() < 8 {
-        return false;
+        return Some(false);
     }
 
     let (body, crc_bytes) = frame.split_at(frame.len() - 4);
     let stored = u32::from_be_bytes(crc_bytes.try_into().unwrap());
-    crc32c::crc32c(body) == stored
+    Some(crc32c::crc32c(body) == stored)
 }
 
 // ---------------------------------------------------------------------------
@@ -626,10 +632,16 @@ mod tests {
     }
 
     #[test]
-    fn test_csp_crc_check_no_crc_flag_passes() {
+    fn test_csp_crc_check_no_crc_flag_is_none() {
         // header with crc bit (LSB) = 0
         let frame = [0x00u8, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
-        assert!(csp_crc32c_check(&frame));
+        assert_eq!(csp_crc32c_check(&frame), None);
+    }
+
+    #[test]
+    fn test_csp_crc_check_too_short_for_header_is_none() {
+        let frame = [0x00u8, 0x00, 0x01];
+        assert_eq!(csp_crc32c_check(&frame), None);
     }
 
     #[test]
@@ -639,7 +651,7 @@ mod tests {
         let crc = crc32c::crc32c(&frame);
         frame.extend_from_slice(&crc.to_be_bytes());
 
-        assert!(csp_crc32c_check(&frame));
+        assert_eq!(csp_crc32c_check(&frame), Some(true));
     }
 
     #[test]
@@ -650,6 +662,13 @@ mod tests {
         frame.extend_from_slice(&crc.to_be_bytes());
         *frame.last_mut().unwrap() ^= 0xFF;
 
-        assert!(!csp_crc32c_check(&frame));
+        assert_eq!(csp_crc32c_check(&frame), Some(false));
+    }
+
+    #[test]
+    fn test_csp_crc_check_flag_set_but_no_room_for_trailer() {
+        // crc bit set, but only 4 bytes total (header only, no trailer)
+        let frame = [0x00u8, 0x00, 0x00, 0x01];
+        assert_eq!(csp_crc32c_check(&frame), Some(false));
     }
 }

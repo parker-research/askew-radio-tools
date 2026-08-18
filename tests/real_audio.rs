@@ -61,15 +61,16 @@ fn test_satnogs_observation_14813295_decodes_at_least_10_good_frames() {
 
     let records = pipeline::decode_file(path_str).expect("pipeline should run without error");
 
-    // "Good" requires both RS correctability *and* a passing CSP CRC: CRC
-    // alone isn't a reliable signal on its own here, since it trivially
-    // "passes" whenever a frame's CRC flag bit happens to be unset — which
-    // noise-driven RS-uncorrectable frames hit by chance about half the
-    // time. RS correctability is what actually establishes the frame is
-    // real.
+    // "Good" requires RS correctability, and no *explicit* CRC failure
+    // (crc_pass: Some(false)) — a frame with no CRC field at all
+    // (crc_pass: None) doesn't count against it, since there's nothing to
+    // have failed. RS correctability is what actually establishes the
+    // frame is real; CRC alone isn't a reliable signal on its own, since a
+    // noise-driven RS-uncorrectable frame can still hit a matching CRC (or
+    // lack one) by chance.
     let good: Vec<_> = records
         .iter()
-        .filter(|r| r.rs_correctable && r.crc_pass)
+        .filter(|r| r.rs_correctable && r.crc_pass != Some(false))
         .collect();
     let rs_uncorrectable: Vec<_> = records.iter().filter(|r| !r.rs_correctable).collect();
     let bad_count = records.len() - good.len();
