@@ -1,12 +1,8 @@
 //! Integration tests against real SatNOGS observation audio.
 //!
-//! These download real recordings over HTTPS, so they're `#[ignore]`d by
-//! default (no network access in normal `cargo test` / CI runs). Run them
-//! explicitly with:
-//!
-//! ```sh
-//! cargo test --test real_audio -- --ignored --nocapture
-//! ```
+//! These download real recordings over HTTPS on every `cargo test` run (not
+//! `#[ignore]`d — this project isn't considered working until this passes
+//! against real captures, so it runs by default). Requires network access.
 //!
 //! Downloaded files are cached under `target/test-cache/` (gitignored via
 //! `/target`) so repeated runs don't re-fetch them.
@@ -58,7 +54,6 @@ fn fetch_cached(url: &str) -> PathBuf {
 /// the whole DSP -> framing -> RS -> CRC pipeline against real hardware
 /// output, not just synthetic fixtures.
 #[test]
-#[ignore = "downloads real audio from the network; run with `--ignored`"]
 fn test_satnogs_observation_14813295_decodes_at_least_10_good_frames() {
     let url = "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/8/18/17/14813295/satnogs_14813295_2026-08-18T17-05-35.ogg";
     let path = fetch_cached(url);
