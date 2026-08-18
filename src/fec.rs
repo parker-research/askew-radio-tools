@@ -1,315 +1,318 @@
-//! FEC and integrity: CCSDS de-randomization, Reed-Solomon, CRC-32C.
+//! Reed-Solomon decoding and CSP-level CRC verification for AX100 Mode 5.
 //!
-//! Applied in order after frame extraction:
-//!  1. CCSDS de-randomize (XOR with PN sequence)
-//!  2. Reed-Solomon RS(255,223) decode — strips 32 parity bytes
-//!  3. CRC-32C verify + strip — strips 4 CRC bytes
+//! The Reed-Solomon decoder is a close port of Phil Karn's `decode_rs_8`
+//! (`libfec`, as vendored into gr-satellites at `lib/libfec/decode_rs_8.c`
+//! + `decode_rs.h`), with the fixed CCSDS (255,223) parameters from
+//! `lib/libfec/fixed.h`:
 //!
-//! The output is the raw CSP packet payload bytes.
+//!   - `NN=255`, `NROOTS=32` (32 parity bytes, corrects up to 16 errors)
+//!   - `FCR=112`, `PRIM=11` (note: *not* consecutive roots — this is the
+//!     detail that's easy to get wrong when porting from a "normal" RS
+//!     decoder)
+//!   - GF(2^8) generator polynomial `x^8+x^7+x^2+x+1` (`0x187`)
+//!
+//! `ax100_decode_impl.cc`'s `msg_handler` calls `decode_rs_8` directly (not
+//! `decode_rs_ccsds`), i.e. **no dual-basis conversion** — the AX100 modem
+//! already produces/expects the conventional basis, so we don't need the
+//! `Taltab`/`Tal1tab` transform either.
+//!
+//! CSP-level CRC verification (`crc_pass`) mirrors gr-satellites'
+//! `crcs.crc32c()` helper (`python/crcs.py`), which is `libcsp`'s CRC32C
+//! (Castagnoli) over the frame, present only when the CSP header's `crc`
+//! flag bit is set.
 
 use crate::DecodeError;
 
 // ---------------------------------------------------------------------------
-// CCSDS Pseudo-Random De-randomizer
+// CCSDS GF(2^8) tables (see lib/libfec/ccsds.c)
 // ---------------------------------------------------------------------------
-//
-// CCSDS pseudo-random sequence generator:
-//   polynomial: h(x) = x⁸ + x⁷ + x⁵ + x³ + 1  (0xA9 in Galois form)
-//   seed: 0xFF at start of each frame
-//
-// The same XOR sequence is used to randomize and de-randomize (it's its own
-// inverse), so this function both randomizes and de-randomizes.
 
-/// CCSDS LFSR polynomial taps (feedback polynomial h(x) = x⁸+x⁷+x⁵+x³+1).
-const CCSDS_POLY: u8 = 0xA9; // bits 7,5,3,0 set
-
-/// Generate `len` bytes of the CCSDS pseudo-random sequence starting from
-/// the standard initial state (0xFF). Pre-compute on first call; callers
-/// can also call directly per-frame.
-pub fn ccsds_sequence(len: usize) -> Vec<u8> {
-    let mut seq = Vec::with_capacity(len);
-    let mut lfsr: u8 = 0xFF; // initial state per CCSDS standard
-
-    for _ in 0..len {
-        let mut byte = 0u8;
-        for bit in 0..8 {
-            // Output bit is the MSB of the LFSR
-            let out_bit = (lfsr >> 7) & 1;
-            byte |= out_bit << (7 - bit);
-
-            // Feedback: XOR taps and shift
-            let feedback = if out_bit == 1 { CCSDS_POLY } else { 0 };
-            lfsr = lfsr.wrapping_shl(1) ^ feedback;
-        }
-        seq.push(byte);
-    }
-    seq
-}
-
-/// Apply (or reverse) CCSDS pseudo-randomization in-place.
-pub fn ccsds_derandomize(data: &mut Vec<u8>) {
-    let seq = ccsds_sequence(data.len());
-    for (byte, mask) in data.iter_mut().zip(seq.iter()) {
-        *byte ^= mask;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reed-Solomon RS(255, 223) decoder
-// ---------------------------------------------------------------------------
-//
-// CCSDS uses GF(2⁸) with primitive polynomial p(x) = x⁸+x⁷+x²+x+1 (0x187),
-// primitive root α=2, first consecutive root b=112, block length 255,
-// data symbols 223, parity symbols 32.
-//
-// We implement a pure-Rust RS decoder following the Berlekamp-Massey /
-// Forney algorithm over GF(2⁸). This is a complete self-contained
-// implementation targeting the exact CCSDS parameters.
-
-/// CCSDS GF(2⁸) primitive polynomial: x⁸+x⁷+x²+x+1 = 0x187
+const NN: usize = 255;
+const NROOTS: usize = 32;
+const FCR: i32 = 112;
+const PRIM: i32 = 11;
+const IPRIM: i32 = 116; // modular inverse of PRIM mod 255
 const GF_POLY: u16 = 0x187;
-const GF_SIZE: usize = 256;
-const RS_N: usize = 255; // codeword length
-const RS_K: usize = 223; // data symbols
-const RS_T: usize = 16; // symbol errors correctable (2T = 32 parity bytes)
-const RS_B: usize = 112; // first consecutive root (CCSDS)
+const A0: u8 = NN as u8; // sentinel: "index of zero"
 
-/// Galois Field GF(2⁸) arithmetic tables.
-struct Gf256 {
-    exp: [u8; 512], // α^i for i in 0..511 (duplicated for wrap-around)
-    log: [u8; 256], // log_α(x) for x in 1..255; log[0] is undefined
+struct GfTables {
+    alpha_to: [u8; 256],
+    index_of: [u8; 256],
 }
 
-impl Gf256 {
+impl GfTables {
     fn new() -> Self {
-        let mut exp = [0u8; 512];
-        let mut log = [0u8; 256];
+        let mut alpha_to = [0u8; 256];
+        let mut index_of = [0u8; 256];
+        index_of[0] = A0;
+
         let mut x: u16 = 1;
         for i in 0..255usize {
-            exp[i] = x as u8;
-            exp[i + 255] = x as u8;
-            log[x as usize] = i as u8;
+            alpha_to[i] = x as u8;
+            index_of[x as usize] = i as u8;
             x <<= 1;
             if x & 0x100 != 0 {
                 x ^= GF_POLY;
             }
         }
-        Gf256 { exp, log }
-    }
-
-    #[inline]
-    fn mul(&self, a: u8, b: u8) -> u8 {
-        if a == 0 || b == 0 {
-            return 0;
-        }
-        self.exp[(self.log[a as usize] as usize) + (self.log[b as usize] as usize)]
-    }
-
-    #[inline]
-    fn div(&self, a: u8, b: u8) -> u8 {
-        debug_assert!(b != 0, "GF division by zero");
-        if a == 0 {
-            return 0;
-        }
-        let la = self.log[a as usize] as usize;
-        let lb = self.log[b as usize] as usize;
-        self.exp[(la + 255 - lb) % 255]
-    }
-
-    #[inline]
-    fn pow(&self, base: u8, exp: usize) -> u8 {
-        if base == 0 {
-            return 0;
-        }
-        self.exp[(self.log[base as usize] as usize * exp) % 255]
-    }
-
-    #[inline]
-    fn alpha_pow(&self, exp: usize) -> u8 {
-        self.exp[exp % 255]
+        GfTables { alpha_to, index_of }
     }
 }
 
-/// Decode a Reed-Solomon RS(255,223) codeword (255 bytes) and return the
-/// 223 corrected data bytes. Strips the 32 parity bytes.
-///
-/// # Errors
-/// Returns [`DecodeError::ReedSolomonFailed`] if there are more than 16
-/// symbol errors (uncorrectable).
-pub fn rs_decode(codeword: &[u8]) -> Result<Vec<u8>, DecodeError> {
-    if codeword.len() != RS_N {
-        return Err(DecodeError::ReedSolomonFailed);
+/// `mod255(x)` from `fixed.h`: fast reduction assuming `x >= 0`.
+fn modnn(mut x: i32) -> u8 {
+    while x >= 255 {
+        x -= 255;
+        x = (x >> 8) + (x & 255);
     }
+    x as u8
+}
 
-    let gf = Gf256::new();
+// ---------------------------------------------------------------------------
+// Reed-Solomon decode (port of decode_rs.h, specialised to no_eras=0)
+// ---------------------------------------------------------------------------
 
-    // 1. Compute syndromes S_i = r(α^(b+i)) for i = 0..2T-1
-    let mut syndromes = vec![0u8; 2 * RS_T];
-    for (i, s) in syndromes.iter_mut().enumerate() {
-        let root = gf.alpha_pow(RS_B + i);
-        let mut acc = 0u8;
-        for &byte in codeword {
-            acc = gf.mul(acc, root) ^ byte;
-        }
-        *s = acc;
+/// Decode `data` (the `NN - pad` real symbols, i.e. the tail of a virtual
+/// `NN`-symbol codeword whose first `pad` symbols are implicitly zero) in
+/// place. Returns the number of corrected symbols, or `-1` if uncorrectable.
+fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize) -> i32 {
+    let n_data = NN - pad;
+    debug_assert_eq!(data.len(), n_data);
+
+    let alpha_to = &gf.alpha_to;
+    let index_of = &gf.index_of;
+
+    let mut lambda = [0u8; NROOTS + 1];
+    let mut s = [0u8; NROOTS];
+    let mut b = [0u8; NROOTS + 1];
+    let mut t = [0u8; NROOTS + 1];
+    let mut omega = [0u8; NROOTS + 1];
+    let mut root = [0i32; NROOTS];
+    let mut reg = [0u8; NROOTS + 1];
+    let mut loc = [0i32; NROOTS];
+
+    // --- Syndromes: evaluate data(x) at the NROOTS code roots ---
+    for slot in s.iter_mut() {
+        *slot = data[0];
     }
-
-    if syndromes.iter().all(|&s| s == 0) {
-        // No errors — return data portion directly
-        return Ok(codeword[..RS_K].to_vec());
-    }
-
-    // 2. Berlekamp-Massey to find error locator polynomial Λ(x)
-    let lambda = berlekamp_massey(&gf, &syndromes);
-
-    if lambda.len() - 1 > RS_T {
-        return Err(DecodeError::ReedSolomonFailed);
-    }
-
-    // 3. Chien search to find error locations
-    let mut error_positions: Vec<usize> = Vec::new();
-    for j in 0..RS_N {
-        // Evaluate Λ(α^(-j)) — error locator root
-        let alpha_inv = gf.alpha_pow(255 - j % 255);
-        let mut val = 0u8;
-        let mut alpha_pow = 1u8;
-        for &coeff in &lambda {
-            val ^= gf.mul(coeff, alpha_pow);
-            alpha_pow = gf.mul(alpha_pow, alpha_inv);
-        }
-        if val == 0 {
-            error_positions.push(j);
-        }
-    }
-
-    if error_positions.len() != lambda.len() - 1 {
-        return Err(DecodeError::ReedSolomonFailed);
-    }
-
-    // 4. Forney algorithm to compute error magnitudes
-    let mut corrected = codeword.to_vec();
-    let omega = error_evaluator(&gf, &syndromes, &lambda);
-
-    for &pos in &error_positions {
-        let x_k = gf.alpha_pow(pos);
-        let x_k_inv = gf.alpha_pow(255 - pos % 255);
-
-        // Evaluate Ω(X_k^-1)
-        let mut omega_val = 0u8;
-        let mut x_pow = 1u8;
-        for &coeff in &omega {
-            omega_val ^= gf.mul(coeff, x_pow);
-            x_pow = gf.mul(x_pow, x_k_inv);
-        }
-
-        // Evaluate Λ'(X_k^-1) — formal derivative (even powers vanish in GF(2))
-        let mut lambda_prime = 0u8;
-        let mut x_p = 1u8;
-        for (i, &coeff) in lambda.iter().enumerate() {
-            if i % 2 == 1 {
-                lambda_prime ^= gf.mul(coeff, x_p);
+    for &byte in &data[1..n_data] {
+        for i in 0..NROOTS {
+            if s[i] == 0 {
+                s[i] = byte;
+            } else {
+                s[i] = byte
+                    ^ alpha_to[modnn(index_of[s[i] as usize] as i32 + (FCR + i as i32) * PRIM)
+                        as usize];
             }
-            x_p = gf.mul(x_p, x_k_inv);
         }
-
-        if lambda_prime == 0 {
-            return Err(DecodeError::ReedSolomonFailed);
-        }
-
-        let magnitude = gf.mul(gf.div(omega_val, lambda_prime), x_k);
-        // Position in codeword: α^pos corresponds to codeword[N-1-pos]
-        let codeword_pos = (RS_N - 1 - pos % RS_N) % RS_N;
-        corrected[codeword_pos] ^= magnitude;
     }
 
-    Ok(corrected[..RS_K].to_vec())
-}
+    let mut syn_error = 0u8;
+    for i in 0..NROOTS {
+        syn_error |= s[i];
+        s[i] = index_of[s[i] as usize];
+    }
+    if syn_error == 0 {
+        // Zero syndrome: data is already a valid codeword.
+        return 0;
+    }
 
-/// Berlekamp-Massey algorithm: finds the minimal-length LFSR (error locator
-/// polynomial) that generates the given syndrome sequence.
-fn berlekamp_massey(gf: &Gf256, syndromes: &[u8]) -> Vec<u8> {
-    let n = syndromes.len();
-    let mut lambda = vec![0u8; n + 1];
-    let mut b = vec![0u8; n + 1];
     lambda[0] = 1;
-    b[0] = 1;
-    let mut l = 0usize;
-    let mut m = 1usize;
-    let mut b_val = 1u8;
-
-    for i in 0..n {
-        // Compute discrepancy delta
-        let mut delta = syndromes[i];
-        for j in 1..=l {
-            delta ^= gf.mul(lambda[j], syndromes[i - j]);
-        }
-
-        if delta == 0 {
-            m += 1;
-            continue;
-        }
-
-        let t = lambda.clone();
-        let coeff = gf.div(delta, b_val);
-        for j in m..=n {
-            lambda[j] ^= gf.mul(coeff, b[j - m]);
-        }
-
-        if 2 * l <= i {
-            l = i + 1 - l;
-            b = t;
-            b_val = delta;
-            m = 1;
-        } else {
-            m += 1;
-        }
+    for i in 0..=NROOTS {
+        b[i] = index_of[lambda[i] as usize];
     }
 
-    lambda.truncate(l + 1);
-    lambda
-}
-
-/// Error evaluator polynomial Ω(x) = S(x)·Λ(x) mod x^(2T).
-fn error_evaluator(gf: &Gf256, syndromes: &[u8], lambda: &[u8]) -> Vec<u8> {
-    let two_t = 2 * RS_T;
-    let mut omega = vec![0u8; two_t];
-    for i in 0..two_t {
-        for j in 0..lambda.len().min(i + 1) {
-            if i - j < syndromes.len() {
-                omega[i] ^= gf.mul(lambda[j], syndromes[i - j]);
+    // --- Berlekamp-Massey ---
+    let mut r: i32 = 0;
+    let mut el: i32 = 0;
+    while r < NROOTS as i32 {
+        r += 1;
+        let mut discr_r: u8 = 0;
+        for i in 0..r as usize {
+            if lambda[i] != 0 && s[r as usize - i - 1] != A0 {
+                discr_r ^= alpha_to[modnn(
+                    index_of[lambda[i] as usize] as i32 + s[r as usize - i - 1] as i32,
+                ) as usize];
             }
         }
+        let discr_r_idx = index_of[discr_r as usize];
+        if discr_r_idx == A0 {
+            for i in (1..=NROOTS).rev() {
+                b[i] = b[i - 1];
+            }
+            b[0] = A0;
+        } else {
+            t[0] = lambda[0];
+            for i in 0..NROOTS {
+                if b[i] != A0 {
+                    t[i + 1] =
+                        lambda[i + 1] ^ alpha_to[modnn(discr_r_idx as i32 + b[i] as i32) as usize];
+                } else {
+                    t[i + 1] = lambda[i + 1];
+                }
+            }
+            if 2 * el <= r - 1 {
+                el = r - el;
+                for i in 0..=NROOTS {
+                    b[i] = if lambda[i] == 0 {
+                        A0
+                    } else {
+                        modnn(index_of[lambda[i] as usize] as i32 - discr_r_idx as i32 + NN as i32)
+                    };
+                }
+            } else {
+                for i in (1..=NROOTS).rev() {
+                    b[i] = b[i - 1];
+                }
+                b[0] = A0;
+            }
+            lambda.copy_from_slice(&t);
+        }
     }
-    // Trim trailing zeros
-    while omega.len() > 1 && *omega.last().unwrap() == 0 {
-        omega.pop();
+
+    // Convert lambda to index form, find deg(lambda).
+    let mut deg_lambda = 0usize;
+    for i in 0..=NROOTS {
+        lambda[i] = index_of[lambda[i] as usize];
+        if lambda[i] != A0 {
+            deg_lambda = i;
+        }
     }
-    omega
+
+    // --- Chien search: find roots of the error locator polynomial ---
+    reg[1..=NROOTS].copy_from_slice(&lambda[1..=NROOTS]);
+    let mut count = 0usize;
+    let mut k: i32 = IPRIM - 1;
+    let mut i: i32 = 1;
+    while i <= NN as i32 {
+        let mut q: u8 = 1;
+        for j in (1..=deg_lambda).rev() {
+            if reg[j] != A0 {
+                reg[j] = modnn(reg[j] as i32 + j as i32);
+                q ^= alpha_to[reg[j] as usize];
+            }
+        }
+        if q == 0 {
+            root[count] = i;
+            loc[count] = k;
+            count += 1;
+            if count == deg_lambda {
+                break;
+            }
+        }
+        i += 1;
+        k = modnn(k + IPRIM) as i32;
+    }
+
+    if deg_lambda != count {
+        // Number of roots doesn't match deg(lambda) => uncorrectable.
+        return -1;
+    }
+
+    // --- Forney: compute error-evaluator poly and apply corrections ---
+    let deg_omega: i32 = deg_lambda as i32 - 1;
+    if deg_omega >= 0 {
+        for i in 0..=(deg_omega as usize) {
+            let mut tmp: u8 = 0;
+            for j in (0..=i).rev() {
+                if s[i - j] != A0 && lambda[j] != A0 {
+                    tmp ^= alpha_to[modnn(s[i - j] as i32 + lambda[j] as i32) as usize];
+                }
+            }
+            omega[i] = index_of[tmp as usize];
+        }
+    }
+
+    for j in (0..count).rev() {
+        let mut num1: u8 = 0;
+        if deg_omega >= 0 {
+            for i in (0..=(deg_omega as usize)).rev() {
+                if omega[i] != A0 {
+                    num1 ^= alpha_to[modnn(omega[i] as i32 + i as i32 * root[j]) as usize];
+                }
+            }
+        }
+        let num2 = alpha_to[modnn(root[j] * (FCR - 1) + NN as i32) as usize];
+
+        let mut den: u8 = 0;
+        let upper = deg_lambda.min(NROOTS - 1) & !1usize;
+        let mut ii = upper as i32;
+        while ii >= 0 {
+            if lambda[(ii + 1) as usize] != A0 {
+                den ^= alpha_to[modnn(lambda[(ii + 1) as usize] as i32 + ii * root[j]) as usize];
+            }
+            ii -= 2;
+        }
+        if den == 0 {
+            // The reference decoder only checks this under DEBUG; treat it
+            // as uncorrectable rather than applying a garbage correction.
+            return -1;
+        }
+
+        if num1 != 0 && loc[j] >= pad as i32 {
+            let idx = (loc[j] - pad as i32) as usize;
+            data[idx] ^= alpha_to[modnn(
+                index_of[num1 as usize] as i32 + index_of[num2 as usize] as i32 + NN as i32
+                    - index_of[den as usize] as i32,
+            ) as usize];
+        }
+    }
+
+    count as i32
+}
+
+/// Decode one AX100 Mode 5 frame (the 256 bytes following the syncword:
+/// `[LEN, ...codeword tail]`), mirroring `ax100_decode_impl::msg_handler`.
+///
+/// Returns the recovered CSP frame bytes (RS parity stripped) and the
+/// number of symbol errors the RS decoder corrected.
+pub fn ax100_rs_decode(frame: &[u8; 256]) -> Result<(Vec<u8>, u32), DecodeError> {
+    let len_byte = frame[0] as i32;
+    let pad = 255 - len_byte + 1;
+    if !(0..=222).contains(&pad) {
+        return Err(DecodeError::ReedSolomonFailed);
+    }
+    let pad = pad as usize;
+    let real_len = NN - pad; // == len_byte - 1
+    if real_len < NROOTS {
+        return Err(DecodeError::ReedSolomonFailed);
+    }
+
+    let gf = GfTables::new();
+    let mut data = frame[1..1 + real_len].to_vec();
+    let count = decode_rs8(&gf, &mut data, pad);
+    if count < 0 {
+        return Err(DecodeError::ReedSolomonFailed);
+    }
+
+    let payload_len = real_len - NROOTS;
+    Ok((data[..payload_len].to_vec(), count as u32))
 }
 
 // ---------------------------------------------------------------------------
-// CRC-32C verification
+// CSP-level CRC32C verification
 // ---------------------------------------------------------------------------
 
-/// Verify the CRC-32C appended to a Reed-Solomon decoded payload and return
-/// the payload without the 4-byte CRC trailer.
-///
-/// The last 4 bytes of `payload` must be the CRC-32C checksum (little-endian)
-/// over the preceding bytes.
-pub fn crc32c_verify_and_strip(payload: &[u8]) -> Result<Vec<u8>, DecodeError> {
-    if payload.len() < 4 {
-        return Err(DecodeError::CrcMismatch);
+/// Check the CSP CRC on a decoded CSP frame, following the `crc` flag bit
+/// in the CSP header (bit 0 of the big-endian 32-bit header word — see
+/// `python/csp_header.py`'s `CSP.crc`). If the flag is clear there's no
+/// trailer to check, so this returns `true` (nothing failed).
+pub fn csp_crc32c_check(frame: &[u8]) -> bool {
+    if frame.len() < 4 {
+        return false;
+    }
+    let header = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+    let crc_flag = header & 1 != 0;
+    if !crc_flag {
+        return true;
+    }
+    if frame.len() < 8 {
+        return false;
     }
 
-    let (data, crc_bytes) = payload.split_at(payload.len() - 4);
-    let stored_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
-    let computed_crc = crc32c::crc32c(data);
-
-    if computed_crc != stored_crc {
-        return Err(DecodeError::CrcMismatch);
-    }
-
-    Ok(data.to_vec())
+    let (body, crc_bytes) = frame.split_at(frame.len() - 4);
+    let stored = u32::from_be_bytes(crc_bytes.try_into().unwrap());
+    crc32c::crc32c(body) == stored
 }
 
 // ---------------------------------------------------------------------------
@@ -321,63 +324,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ccsds_sequence_first_bytes() {
-        // Verify the CCSDS PN sequence is non-trivial and deterministic.
-        let seq = ccsds_sequence(16);
-        assert!(
-            seq.iter().any(|&b| b != 0),
-            "PN sequence should be non-zero"
-        );
-        let seq2 = ccsds_sequence(16);
-        assert_eq!(seq, seq2, "PN sequence must be deterministic");
+    fn test_rs_decode_rejects_short_len_byte() {
+        let mut frame = [0u8; 256];
+        frame[0] = 10; // pad = 256-10 = 246 > 222 -> invalid
+        assert!(matches!(
+            ax100_rs_decode(&frame),
+            Err(DecodeError::ReedSolomonFailed)
+        ));
     }
 
     #[test]
-    fn test_ccsds_derandomize_involution() {
-        let original = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78];
-        let mut data = original.clone();
-        ccsds_derandomize(&mut data);
-        ccsds_derandomize(&mut data); // apply twice — should restore original
-        assert_eq!(
-            data, original,
-            "CCSDS derandomize should be its own inverse"
-        );
+    fn test_rs_decode_all_zero_codeword() {
+        // All-zero data is trivially a valid codeword (zero syndrome).
+        let mut frame = [0u8; 256];
+        frame[0] = 255; // pad=1, real_len=254, payload_len=254-32=222
+        let (payload, corrected) = ax100_rs_decode(&frame).expect("should decode cleanly");
+        assert_eq!(payload.len(), 222);
+        assert!(payload.iter().all(|&b| b == 0));
+        assert_eq!(corrected, 0);
     }
 
     #[test]
-    fn test_rs_no_errors() {
-        // Build a valid RS(255,223) codeword with all-zero data and
-        // verify it round-trips cleanly. We simulate by encoding
-        // a known sequence and checking the decoded output.
-        // (Full encoder omitted here — we test the zero-error path.)
-        // A valid codeword of 255 zero bytes has zero syndrome → passes.
-        let codeword = vec![0u8; RS_N];
-        let result = rs_decode(&codeword).expect("All-zero codeword should decode cleanly");
-        assert_eq!(result.len(), RS_K);
-        assert!(result.iter().all(|&b| b == 0));
+    fn test_rs_decode_corrects_single_byte_error() {
+        // Build a valid all-zero codeword, corrupt one parity byte, and
+        // confirm the decoder both detects and repairs it.
+        let mut frame = [0u8; 256];
+        frame[0] = 255;
+        frame[50] ^= 0x5A; // corrupt one byte inside the codeword region
+
+        let (payload, corrected) = ax100_rs_decode(&frame).expect("should correct 1 error");
+        assert!(payload.iter().all(|&b| b == 0));
+        assert_eq!(corrected, 1);
     }
 
     #[test]
-    fn test_crc32c_verify_and_strip_valid() {
-        let data = b"CSP beacon payload data here!";
-        let crc = crc32c::crc32c(data);
-        let mut payload = data.to_vec();
-        payload.extend_from_slice(&crc.to_le_bytes());
-
-        let stripped = crc32c_verify_and_strip(&payload).expect("CRC should match");
-        assert_eq!(stripped, data);
+    fn test_csp_crc_check_no_crc_flag_passes() {
+        // header with crc bit (LSB) = 0
+        let frame = [0x00u8, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        assert!(csp_crc32c_check(&frame));
     }
 
     #[test]
-    fn test_crc32c_verify_and_strip_invalid() {
-        let data = b"CSP beacon payload data here!";
-        let crc = crc32c::crc32c(data);
-        let mut payload = data.to_vec();
-        payload.extend_from_slice(&crc.to_le_bytes());
-        // Corrupt the last byte
-        *payload.last_mut().unwrap() ^= 0xFF;
+    fn test_csp_crc_check_valid() {
+        let mut frame = vec![0x00u8, 0x00, 0x00, 0x01]; // crc bit set
+        frame.extend_from_slice(b"hello world");
+        let crc = crc32c::crc32c(&frame);
+        frame.extend_from_slice(&crc.to_be_bytes());
 
-        let result = crc32c_verify_and_strip(&payload);
-        assert!(matches!(result, Err(DecodeError::CrcMismatch)));
+        assert!(csp_crc32c_check(&frame));
+    }
+
+    #[test]
+    fn test_csp_crc_check_invalid() {
+        let mut frame = vec![0x00u8, 0x00, 0x00, 0x01];
+        frame.extend_from_slice(b"hello world");
+        let crc = crc32c::crc32c(&frame);
+        frame.extend_from_slice(&crc.to_be_bytes());
+        *frame.last_mut().unwrap() ^= 0xFF;
+
+        assert!(!csp_crc32c_check(&frame));
     }
 }

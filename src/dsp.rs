@@ -1,12 +1,10 @@
-//! DSP pipeline: FM discriminator → low-pass filter → symbol timing → bit decisions.
+//! DSP pipeline: low-pass filter → symbol timing → bit decisions.
 //!
 //! ## Pipeline overview
 //!
 //! ```text
-//! f32 audio samples (real IF from SDR)
-//!      │
-//!      ▼
-//! [FM Discriminator]   arg(s[n] * conj(s[n-1]))  →  instantaneous freq deviation
+//! f32 audio samples (already FM/GFSK-demodulated frequency deviation,
+//!                     as produced by the SDR/ground-station chain)
 //!      │
 //!      ▼
 //! [Biquad Low-Pass]    ~14.4 kHz cutoff (1.5× symbol rate)
@@ -18,15 +16,23 @@
 //! [Slicer]             threshold at 0 → Vec<bool> NRZ bits
 //! ```
 //!
-//! The SatNOGS audio represents the *already FM-demodulated* IF, so the
-//! "FM discriminator" here is a classic complex differential detector applied
-//! to the analytic signal. For real-valued audio input (one channel, no
-//! quadrature) we first form the analytic signal via a Hilbert transform
-//! approximated by a 64-tap FIR. This yields I+jQ from which the
-//! instantaneous frequency can be extracted.
+//! SatNOGS "audio" captures for AX100 are the *already demodulated*
+//! instantaneous-frequency waveform (this is what gr-satellites'
+//! `ax100_deframer` itself expects as input: "a float stream of soft
+//! symbols" — the demod, typically `quadrature_demod_cf`, has already run
+//! upstream in the SDR chain). So there is no FM/Hilbert discriminator
+//! stage here: `audio.samples` is used directly as the frequency-deviation
+//! signal, positive values meaning the "mark" tone and negative values the
+//! "space" tone.
+//!
+//! (An earlier version of this module additionally ran a Hilbert-transform
+//! based FM discriminator on top of this signal, which is both redundant
+//! with an already-demodulated input and numerically wrong at AX100's
+//! symbol rate: a 64-tap Hilbert FIR is not accurate enough at 3200 Hz
+//! relative to a 48 kHz sample rate, and was verified to produce the same
+//! sign for both +3200 Hz and -3200 Hz tones.)
 
 use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type};
-use num_complex::Complex32;
 
 use crate::audio::AudioSamples;
 
@@ -35,6 +41,9 @@ use crate::audio::AudioSamples;
 pub struct BitStream {
     /// NRZ bits, MSB first, as recovered by the symbol timing loop.
     pub bits: Vec<bool>,
+    /// Timestamp of each bit in `bits` (same index), in milliseconds from
+    /// the start of the input audio file.
+    pub bit_times_ms: Vec<f64>,
     /// Estimated symbol rate after timing recovery (Hz). Should be ≈ 9600.
     pub recovered_symbol_rate: f64,
 }
@@ -51,108 +60,26 @@ pub fn fm_discriminate_and_filter(audio: &AudioSamples) -> BitStream {
     let fs = audio.sample_rate as f64;
     let symbol_rate = 9600.0_f64;
 
-    // 1. Build analytic signal (real → complex) via Hilbert FIR
-    let analytic = hilbert_transform(&audio.samples);
-
-    // 2. FM discriminator: instantaneous frequency
-    let freq_deviation = fm_discriminator(&analytic);
-
-    // 3. Low-pass filter at 1.5 × symbol_rate to strip out-of-band noise
+    // 1. Low-pass filter at 1.5 × symbol_rate to strip out-of-band noise
     let lpf_cutoff = symbol_rate * 1.5; // 14 400 Hz
-    let filtered = lowpass_filter(&freq_deviation, fs, lpf_cutoff);
+    let filtered = lowpass_filter(&audio.samples, fs, lpf_cutoff);
 
-    // 4. Gardner timing error detector + interpolated sampling
-    let (symbols, recovered_rate) = gardner_ted(&filtered, fs, symbol_rate);
+    // 2. Gardner timing error detector + interpolated sampling
+    let (symbols, sample_positions, recovered_rate) = gardner_ted(&filtered, fs, symbol_rate);
 
-    // 5. Hard decision (slicer): positive deviation → 1, negative → 0
+    // 3. Hard decision (slicer): positive deviation → 1, negative → 0
     let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
+    let bit_times_ms: Vec<f64> = sample_positions.iter().map(|&p| p / fs * 1000.0).collect();
 
     BitStream {
         bits,
+        bit_times_ms,
         recovered_symbol_rate: recovered_rate,
     }
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: Hilbert transform (real → analytic signal)
-// ---------------------------------------------------------------------------
-//
-// A 64-tap Type-III linear-phase FIR Hilbert transformer. The analytic signal
-// is: x_a[n] = x[n] + j * H{x[n]}  where H{} is the Hilbert transform.
-//
-// Coefficients for a 64-tap Hilbert FIR (odd indices only, even taps = 0):
-// h[k] = (2/π) * sin²(πk/2) / k   for k odd, 0 for k even
-// Window-weighted with a Hann window for side-lobe suppression.
-
-const HILBERT_TAPS: usize = 64;
-
-fn hilbert_fir_coefficients() -> [f32; HILBERT_TAPS] {
-    use std::f64::consts::PI;
-    let mut h = [0.0f32; HILBERT_TAPS];
-    let half = (HILBERT_TAPS / 2) as i64;
-
-    for i in 0..HILBERT_TAPS {
-        let n = i as i64 - half;
-        if n == 0 || n % 2 == 0 {
-            continue; // zero at even taps and centre
-        }
-        let k = n as f64;
-        // Hilbert ideal: 2/(π k) for odd k
-        let ideal = 2.0 / (PI * k);
-        // Hann window: 0.5 - 0.5*cos(2π(i+0.5)/N)
-        let w = 0.5 - 0.5 * (2.0 * PI * (i as f64 + 0.5) / HILBERT_TAPS as f64).cos();
-        h[i] = (ideal * w) as f32;
-    }
-    h
-}
-
-/// Convert a real-valued signal to its analytic (complex) representation.
-/// The real part is the original signal (delayed by HILBERT_TAPS/2 samples),
-/// the imaginary part is the Hilbert-transformed signal.
-fn hilbert_transform(input: &[f32]) -> Vec<Complex32> {
-    let h = hilbert_fir_coefficients();
-    let delay = HILBERT_TAPS / 2; // group delay in samples
-    let n = input.len();
-    let mut out = vec![Complex32::new(0.0, 0.0); n];
-
-    for i in 0..n {
-        // Real part: delayed original signal
-        let re = if i >= delay { input[i - delay] } else { 0.0 };
-
-        // Imaginary part: FIR convolution with Hilbert kernel
-        let mut im = 0.0f32;
-        for (k, &coeff) in h.iter().enumerate() {
-            if i >= k {
-                im += coeff * input[i - k];
-            }
-        }
-        out[i] = Complex32::new(re, im);
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Step 2: FM discriminator
-// ---------------------------------------------------------------------------
-//
-// Classic complex differential detector:
-//   f[n] = arg( x[n] · conj(x[n-1]) )  / (2π · Ts)
-//
-// This gives instantaneous frequency relative to the carrier. For a ±3200 Hz
-// FSK signal the output swings between approximately ±3200/fs.
-
-fn fm_discriminator(analytic: &[Complex32]) -> Vec<f32> {
-    let mut out = vec![0.0f32; analytic.len()];
-    for i in 1..analytic.len() {
-        let product = analytic[i] * analytic[i - 1].conj();
-        // arg() gives phase difference in radians; scale to [-1, 1] range
-        out[i] = product.arg() / std::f32::consts::PI;
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Step 3: Biquad low-pass filter
+// Step 1: Biquad low-pass filter
 // ---------------------------------------------------------------------------
 //
 // Second-order Butterworth IIR in Direct Form II Transposed.
@@ -172,7 +99,7 @@ fn lowpass_filter(input: &[f32], fs: f64, cutoff_hz: f64) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Step 4: Gardner timing error detector
+// Step 2: Gardner timing error detector
 // ---------------------------------------------------------------------------
 //
 // The Gardner TED is a decision-directed timing error detector that works
@@ -189,8 +116,20 @@ fn lowpass_filter(input: &[f32], fs: f64, cutoff_hz: f64) -> Vec<f32> {
 //
 // Typical values for α and β at 9600 baud / 48 kHz: α≈0.01, β≈0.001.
 
-fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64) -> (Vec<f32>, f64) {
+fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64) -> (Vec<f32>, Vec<f64>, f64) {
     let sps = fs / symbol_rate; // samples per symbol (e.g. 5.0 for 48000/9600)
+
+    // The loop filter gains below are tuned assuming a roughly unit-
+    // amplitude signal. `input` here is a frequency-deviation waveform
+    // that can be at any scale (e.g. ±3200 for a 3200 Hz deviation), which
+    // would otherwise blow the TED error — and thus the correction — up by
+    // orders of magnitude and make the loop diverge instead of track. So
+    // normalise by RMS first; this doesn't affect the final sign-based
+    // slicer decision.
+    let rms = (input.iter().map(|&x| x * x).sum::<f32>() / input.len().max(1) as f32).sqrt();
+    let norm = if rms > 1e-12 { rms } else { 1.0 };
+    let input: Vec<f32> = input.iter().map(|&x| x / norm).collect();
+    let input = input.as_slice();
 
     // Loop filter constants (normalised loop bandwidth ≈ 0.01)
     let alpha = 0.01_f64; // proportional gain
@@ -234,9 +173,13 @@ fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64) -> (Vec<f32>, f64) {
         // Gardner TED error: uses *previous* symbol to avoid decision feedback
         let error = ((y_prev - y_on) * y_mid_prev) as f64;
 
-        // PI loop filter
-        int_err += beta * error;
-        let correction = alpha * error + int_err;
+        // PI loop filter. Clamp the integrator and the resulting correction
+        // so a run of same-signed errors (e.g. a long string of identical
+        // bits, or a sharp-edged square-wave deviation signal) can't wind
+        // the loop up to the point where the strobe stalls or goes
+        // backwards — which would hang the `while` loop below.
+        int_err = (int_err + beta * error).clamp(-sps / 4.0, sps / 4.0);
+        let correction = (alpha * error + int_err).clamp(-sps / 2.0, sps / 2.0);
 
         symbols.push(y_on);
         sample_positions.push(idx);
@@ -256,7 +199,7 @@ fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64) -> (Vec<f32>, f64) {
         symbol_rate
     };
 
-    (symbols, recovered_rate)
+    (symbols, sample_positions, recovered_rate)
 }
 
 // ---------------------------------------------------------------------------
@@ -268,51 +211,50 @@ mod tests {
     use super::*;
     use crate::audio::AudioSamples;
 
-    fn make_fsk_audio(
+    /// Build a synthetic "already-demodulated" AX100 signal: a real-valued
+    /// frequency-deviation waveform (like the output of an SDR's
+    /// `quadrature_demod` block) that swings towards ±`freq_dev` for each
+    /// bit. AX100 uses GFSK (Gaussian-filtered FSK, BT≈0.5), so real
+    /// captures never have the instant, razor-sharp symbol transitions of
+    /// an ideal square wave — we approximate that Gaussian smoothing here
+    /// with a simple one-pole filter so this fixture is representative of
+    /// what the Gardner timing loop actually has to lock onto.
+    fn make_deviation_audio(
         sample_rate: u32,
         symbol_rate: f64,
         bits: &[bool],
         freq_dev: f32,
     ) -> AudioSamples {
-        use std::f32::consts::TAU;
         let sps = sample_rate as f64 / symbol_rate;
         let num_samples = (bits.len() as f64 * sps).ceil() as usize;
-        let mut samples = vec![0.0f32; num_samples];
-        let mut phase = 0.0f32;
-        let fs = sample_rate as f32;
+        let square: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let bit_idx = (i as f64 / sps).floor() as usize;
+                if bits.get(bit_idx).copied().unwrap_or(false) {
+                    freq_dev
+                } else {
+                    -freq_dev
+                }
+            })
+            .collect();
 
-        for (i, sample) in samples.iter_mut().enumerate() {
-            let bit_idx = (i as f64 / sps).floor() as usize;
-            let freq = if bits.get(bit_idx).copied().unwrap_or(false) {
-                freq_dev
-            } else {
-                -freq_dev
-            };
-            phase += TAU * freq / fs;
-            *sample = phase.sin();
-        }
+        // One-pole smoothing (~symbol-rate cutoff) to emulate GFSK's
+        // Gaussian pulse shaping.
+        let alpha = 1.0 - (-1.0 / (sps as f32)).exp();
+        let mut y = 0.0f32;
+        let samples: Vec<f32> = square
+            .iter()
+            .map(|&x| {
+                y += alpha * (x - y);
+                y
+            })
+            .collect();
 
         AudioSamples {
             samples,
             sample_rate,
             channels: 1,
         }
-    }
-
-    #[test]
-    fn test_fm_discriminator_polarity() {
-        // A constant frequency above carrier → all positive output
-        let sample_rate = 48_000u32;
-        let audio = make_fsk_audio(sample_rate, 9600.0, &[true; 200], 3200.0);
-        let analytic = hilbert_transform(&audio.samples);
-        let disc = fm_discriminator(&analytic);
-        // Skip the first few samples (filter startup transients)
-        let mean: f32 = disc[50..].iter().sum::<f32>() / (disc.len() - 50) as f32;
-        assert!(
-            mean > 0.0,
-            "Positive deviation should produce positive discriminator output, got {}",
-            mean
-        );
     }
 
     #[test]
@@ -337,10 +279,14 @@ mod tests {
 
     #[test]
     fn test_full_pipeline_recovers_bits() {
-        // Synthesise 100 alternating bits at 9600 baud / 48 kHz and check that
-        // the pipeline recovers roughly the right number of symbols.
-        let pattern: Vec<bool> = (0..100).map(|i| i % 2 == 0).collect();
-        let audio = make_fsk_audio(48_000, 9600.0, &pattern, 3200.0);
+        // Synthesise a pseudo-random bit pattern (not a plain alternation,
+        // so a phase/count bug can't accidentally look correct) at 9600
+        // baud / 48 kHz and check the pipeline recovers both the right
+        // number of symbols *and* the right values.
+        let pattern: Vec<bool> = (0..200u32)
+            .map(|i| i.wrapping_mul(2654435761).rotate_left(13) % 5 < 2)
+            .collect();
+        let audio = make_deviation_audio(48_000, 9600.0, &pattern, 3200.0);
         let result = fm_discriminate_and_filter(&audio);
 
         // Allow ±10% symbol count variation (timing loop startup)
@@ -354,5 +300,21 @@ mod tests {
             got,
             ratio
         );
+
+        // Align the recovered bits against the known pattern (skip the
+        // first few symbols, which absorb the timing loop's startup
+        // transient) and check most of them match.
+        let skip = 10;
+        let compare_len = (result.bits.len() - skip).min(pattern.len() - skip);
+        let matches = (0..compare_len)
+            .filter(|&i| result.bits[skip + i] == pattern[skip + i])
+            .count();
+        let match_ratio = matches as f64 / compare_len as f64;
+        assert!(
+            match_ratio > 0.95,
+            "Recovered bits should mostly match the transmitted pattern, got {:.1}% match",
+            match_ratio * 100.0
+        );
     }
 }
+
