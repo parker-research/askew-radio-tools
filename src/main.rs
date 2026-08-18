@@ -41,7 +41,10 @@ fn main() {
     }
 }
 
-fn decode_and_print(path: &str, show_filename: bool) -> Result<(), ax100_radio_csp_decoder::DecodeError> {
+fn decode_and_print(
+    path: &str,
+    show_filename: bool,
+) -> Result<(), ax100_radio_csp_decoder::DecodeError> {
     let audio = ax100_radio_csp_decoder::audio::load_audio(path)?;
     let metrics = audio_check::check(&audio);
     eprintln!("{path}: {}", metrics.verdict);
