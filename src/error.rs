@@ -11,18 +11,9 @@ pub enum DecodeError {
     #[error("Unsupported sample rate {rate} Hz — need at least {min} Hz for 9600 baud")]
     SampleRateTooLow { rate: u32, min: u32 },
 
-    #[error("Sync word not found in audio")]
-    SyncNotFound,
-
-    #[error("Golay decode failed — too many errors in length field")]
-    GolayFailed,
-
-    #[error("Reed-Solomon decode failed — frame has >{0} byte errors", 16)]
+    #[error("Reed-Solomon decode failed — frame has invalid LEN byte or >16 byte errors")]
     ReedSolomonFailed,
 
-    #[error("CRC-32C mismatch — frame corrupted beyond RS correction")]
-    CrcMismatch,
-
-    #[error("Frame length {0} out of valid range (0–223 bytes)")]
-    InvalidFrameLength(usize),
+    #[error("Golay(24,12) decode failed — length header has >3 bit errors")]
+    GolayFailed,
 }
