@@ -15,15 +15,21 @@ pub struct BeaconRecord {
     pub filename: String,
     pub data_length_bytes: usize,
     pub time_in_file_ms: f64,
-    pub rs_corrected_error_count: u32,
+    pub rs_corrected_error_count: Option<u32>,
+    /// `true` unless Reed-Solomon found more errors in the frame than it
+    /// can correct (>16 symbol errors) — in that case `data_hex` is a
+    /// best-effort, likely-still-corrupt payload, kept in the output
+    /// rather than dropped so callers can see/inspect what was received.
+    pub rs_correctable: bool,
     pub crc_pass: bool,
     pub data_hex: String,
 }
 
 /// Run the full decode pipeline on one audio file and return every frame
-/// that passed Golay+Reed-Solomon decoding (frames that fail either are
-/// dropped, matching `u482c_decode_impl`'s behaviour of only publishing on
-/// success).
+/// whose Golay-coded header decoded successfully (frames where the header
+/// itself is uncorrectable are dropped — there's no reliable frame length
+/// to extract anything from). Frames where Reed-Solomon couldn't correct
+/// all errors are still included, with `rs_correctable: false`.
 pub fn decode_file(path: &str) -> Result<Vec<BeaconRecord>, DecodeError> {
     let audio = audio::load_audio(path)?;
     Ok(decode_audio(&audio, path))
@@ -48,16 +54,16 @@ pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<BeaconRecord> {
         let raw_frames = framing::find_frames(&bitstream.bits);
 
         for raw in &raw_frames {
-            let (payload, rs_corrected_error_count) = match fec::ax100_asm_golay_decode(&raw.data) {
+            let decoded = match fec::ax100_asm_golay_decode(&raw.data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
 
-            if !seen_payloads.insert(payload.clone()) {
+            if !seen_payloads.insert(decoded.payload.clone()) {
                 continue; // already found via an earlier gain pair
             }
 
-            let crc_pass = fec::csp_crc32c_check(&payload);
+            let crc_pass = fec::csp_crc32c_check(&decoded.payload);
             let time_in_file_ms = bitstream
                 .bit_times_ms
                 .get(raw.sync_bit_offset)
@@ -68,11 +74,12 @@ pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<BeaconRecord> {
 
             records.push(BeaconRecord {
                 filename: filename.to_string(),
-                data_length_bytes: payload.len(),
+                data_length_bytes: decoded.payload.len(),
                 time_in_file_ms,
-                rs_corrected_error_count,
+                rs_corrected_error_count: decoded.rs_corrected_error_count,
+                rs_correctable: decoded.rs_correctable,
                 crc_pass,
-                data_hex: hex_encode(&payload),
+                data_hex: hex_encode(&decoded.payload),
             });
         }
     }

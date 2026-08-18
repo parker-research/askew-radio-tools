@@ -6,9 +6,11 @@
 //! Each already-doppler-corrected audio file is decoded independently.
 //! Decoded CSP frames are written to stdout as JSONL (one JSON object per
 //! line, fields: data_length_bytes, time_in_file_ms,
-//! rs_corrected_error_count, crc_pass, data_hex — plus filename if
-//! `--show-filename` is passed). All other diagnostics go to stderr so
-//! stdout stays valid JSONL.
+//! rs_corrected_error_count, rs_correctable, crc_pass, data_hex — plus
+//! filename if `--show-filename` is passed). Frames with uncorrectable
+//! Reed-Solomon errors are still emitted (rs_correctable: false) rather
+//! than dropped. All other diagnostics go to stderr so stdout stays valid
+//! JSONL.
 
 use ax100_radio_csp_decoder::{audio_check, pipeline};
 use clap::Parser;
