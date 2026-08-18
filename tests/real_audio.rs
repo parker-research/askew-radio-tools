@@ -49,13 +49,56 @@ fn fetch_cached(url: &str) -> PathBuf {
     path
 }
 
-/// A real 9600 baud AX100 Mode 5 SatNOGS observation, known to contain at
-/// least 10 valid (RS + CSP CRC passing) frames — used as a smoke test for
-/// the whole DSP -> framing -> RS -> CRC pipeline against real hardware
-/// output, not just synthetic fixtures.
-#[test]
-fn test_satnogs_observation_14813295_decodes_at_least_10_good_frames() {
-    let url = "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/8/18/17/14813295/satnogs_14813295_2026-08-18T17-05-35.ogg";
+/// A "good" frame's fields, minus `filename` (which is just the input
+/// path, not a property of the decode) — what we lock in exactly below.
+#[derive(Debug, Clone, PartialEq)]
+struct GoodFrame {
+    time_in_file_ms: f64,
+    data_length_bytes: usize,
+    rs_corrected_error_count: Option<u32>,
+    crc_pass: Option<bool>,
+    data_hex: String,
+}
+
+/// Build a `GoodFrame` list from `(time_in_file_ms, data_length_bytes,
+/// rs_corrected_error_count, data_hex)` tuples. All the frames these
+/// SatNOGS observations decode to are FrontierSat CSP frames that never
+/// set the header's `crc` flag, so `crc_pass` is always `None` — if a
+/// future fixture needs a real CRC result, this helper will need a
+/// `crc_pass` column too.
+fn good_frames(raw: &[(f64, usize, u32, &str)]) -> Vec<GoodFrame> {
+    raw.iter()
+        .map(
+            |&(time_in_file_ms, data_length_bytes, rs_corrected_error_count, data_hex)| GoodFrame {
+                time_in_file_ms,
+                data_length_bytes,
+                rs_corrected_error_count: Some(rs_corrected_error_count),
+                crc_pass: None,
+                data_hex: data_hex.to_string(),
+            },
+        )
+        .collect()
+}
+
+/// Download `url`, decode it, and assert that its "good" (RS-correctable,
+/// no explicit CRC failure) frames exactly match `expected` — pinning the
+/// whole DSP -> framing -> Golay -> RS -> CRC pipeline's current decoding
+/// and timestamp precision against real hardware output, not just
+/// synthetic fixtures. Also asserts at least one RS-uncorrectable frame is
+/// present, confirming that feature actually exercises on real, noisy
+/// audio rather than just existing in the type signature.
+///
+/// If a pipeline change deliberately alters decoding or timestamp
+/// precision, regenerate the relevant fixture with:
+///
+/// ```sh
+/// cargo run --release -- --output-filter good <path-to-cached-ogg>
+/// ```
+///
+/// and eyeball the diff before updating it — the payloads all decode to
+/// plausible FrontierSat telemetry text, so a change here is either a real
+/// precision/behavior change worth reviewing, or a regression.
+fn assert_pinned_good_frames(url: &str, expected: &[GoodFrame]) {
     let path = fetch_cached(url);
     let path_str = path.to_str().expect("cache path is valid UTF-8");
 
@@ -68,41 +111,83 @@ fn test_satnogs_observation_14813295_decodes_at_least_10_good_frames() {
     // frame is real; CRC alone isn't a reliable signal on its own, since a
     // noise-driven RS-uncorrectable frame can still hit a matching CRC (or
     // lack one) by chance.
-    let good: Vec<_> = records
+    let good: Vec<GoodFrame> = records
         .iter()
         .filter(|r| r.rs_correctable && r.crc_pass != Some(false))
+        .map(|r| GoodFrame {
+            time_in_file_ms: r.time_in_file_ms,
+            data_length_bytes: r.data_length_bytes,
+            rs_corrected_error_count: r.rs_corrected_error_count,
+            crc_pass: r.crc_pass,
+            data_hex: r.data_hex.clone(),
+        })
         .collect();
-    let rs_uncorrectable: Vec<_> = records.iter().filter(|r| !r.rs_correctable).collect();
-    let bad_count = records.len() - good.len();
 
+    let rs_uncorrectable_count = records.iter().filter(|r| !r.rs_correctable).count();
     eprintln!(
-        "decoded {} frame(s) total: {} good (RS-correctable + CRC pass), {} bad, {} RS-uncorrectable",
+        "{path_str}: decoded {} frame(s) total: {} good, {} RS-uncorrectable",
         records.len(),
         good.len(),
-        bad_count,
-        rs_uncorrectable.len()
-    );
-    for r in &good {
-        eprintln!(
-            "  t={:>9.1}ms  {}B  rs_corrected={:?}  {}",
-            r.time_in_file_ms, r.data_length_bytes, r.rs_corrected_error_count, r.data_hex
-        );
-    }
-
-    assert!(
-        good.len() >= 10,
-        "expected at least 10 good (RS-correctable + CRC passing) frames, got {} (out of {} total)",
-        good.len(),
-        records.len()
+        rs_uncorrectable_count
     );
 
-    // The whole point of keeping RS-uncorrectable frames in the output
-    // (rather than silently dropping them) is that a real, noisy capture
-    // like this one should actually produce some — confirm that's true
-    // rather than just trusting the field exists.
+    assert_eq!(
+        good, expected,
+        "{path_str}: decoded 'good' frames no longer match the pinned expectation — if this \
+         is a deliberate algorithm/precision change, regenerate the fixture (see \
+         assert_pinned_good_frames' doc comment) and review the diff before updating it"
+    );
+
     assert!(
-        !rs_uncorrectable.is_empty(),
-        "expected at least one RS-uncorrectable frame to be present in the output \
+        rs_uncorrectable_count > 0,
+        "{path_str}: expected at least one RS-uncorrectable frame to be present in the output \
          (this capture is known to contain noise-triggered syncword matches)"
+    );
+}
+
+#[test]
+fn test_satnogs_observation_14813295_decodes_exact_good_frames() {
+    #[rustfmt::skip]
+    let raw: &[(f64, usize, u32, &str)] = &[
+        (257002.949, 118, 16, "c2a28a0003313738373036343938313030302b303030383031373131355f45205b413a4f42433a494e464f5d3a204865617274626561743a204461746574696d653a20323032362d30382d3138543137303935382e3131355a5f452c20557074696d653a20323438383433313634206d730a7f52356e"),
+        (262221.573, 106, 4, "c2a28a0003313738373036343938313030302b303030383032323230305f45205b533a4c46533a494e464f5d3a205375636365737366756c6c79206f70656e65642066696c653a20626c6f62732f657874656e6465645f626561636f6e5f76332e626c6f620a7e5d2956"),
+        (262342.373, 106, 2, "c2a28a0003313738373036343938313030302b303030383032323231395f45205b533a4c46533a494e464f5d3a205375636365737366756c6c7920636c6f7365642066696c653a20626c6f62732f657874656e6465645f626561636f6e5f76332e626c6f620a8ee5aec0"),
+        (279024.397, 118, 9, "c2a28a0003313738373036343938313030302b303030383033393133375f45205b413a4f42433a494e464f5d3a204865617274626561743a204461746574696d653a20323032362d30382d3138543137313032302e3133375a5f452c20557074696d653a20323438383635313836206d730a7d12e956"),
+        (306759.038, 94, 10, "c2a28a0003313738373036343938313030302b303030383036363837355f45205b413a54434d443a4552525d3a2054656c65636f6d6d616e6420736b69707065642064756520746f20726570656174656420747373656e742e0a31105856"),
+        (311585.914, 54, 7, "c2a28a00048498da15a00100000047020101657874656e6465645f626561636f6e5f626c6f625f76332073756363657373002cc3d1b7"),
+        (311663.424, 94, 3, "c2a28a0003313738373036343938313030302b303030383037313430395f45205b413a54434d443a4552525d3a2054656c65636f6d6d616e6420736b69707065642064756520746f20726570656174656420747373656e742e0ab913b1b8"),
+        (313811.719, 100, 2, "c2a28a0003313738373036343938313030302b303030383037333932375f45205b543a54434d443a494e464f5d3a20f09f9a8020457865637574696e672074656c65636f6d6d616e642027636f6e6669675f7365745f696e745f766172272e0a57adce15"),
+        (313927.577, 119, 2, "c2a28a0003313738373036343938313030302b303030383037333934355f45205b543a54434d443a494e464f5d3a20f09f9fa22054656c65636f6d6d616e642027636f6e6669675f7365745f696e745f766172272065786563757465642e204475726174696f6e3d316d732c206572723d300a240cd5a0"),
+        (314059.186, 80, 0, "c2a28a000400000000000000000001000101535543434553533a2053657420636f6e666967207661723a2054434d445f726571756972655f756e697175655f747373656e7420746f3a203100099a02b5"),
+        (320449.451, 99, 15, "c2a28a0003313738373036343938313030302b303030383038303534335f45205b533a54434d443a494e464f5d3a20f09f9a8020457865637574696e672074656c65636f6d6d616e642027657865635f626c6f625f66726f6d5f6673272e0ada3a7ac3"),
+        (322808.454, 100, 2, "c2a28a0003313738373036343938313030302b303030383038323932345f45205b543a54434d443a494e464f5d3a20f09f9a8020457865637574696e672074656c65636f6d6d616e642027636f6e6669675f7365745f696e745f766172272e0a0fb9bbb2"),
+        (326247.953, 138, 6, "c2a28a00014354533101009b18d60ea2040000e2f7da15a00100000501e4010e009b2e0000010490cb040000006e3e63ff7f3d05c60e0000a3000000050100003d010000d1000000f7000000bd060000030201020000000248656c6c6f2066726f6d2043616c67617279546f53706163652046726f6e746965725361740000000000454e44005dff8849"),
+    ];
+
+    assert_pinned_good_frames(
+        "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/8/18/17/14813295/satnogs_14813295_2026-08-18T17-05-35.ogg",
+        &good_frames(raw),
+    );
+}
+
+#[test]
+fn test_satnogs_observation_14183111_decodes_exact_good_frames() {
+    #[rustfmt::skip]
+    let raw: &[(f64, usize, u32, &str)] = &[
+        (134484.404, 42, 3, "c2a28a0004a05da76f9e010000001b000101557064617465642073797374656d2074696d6500d8f4c618"),
+        (156974.116, 138, 0, "c2a28a00014354533102005f33b301f4560000f1b4a76f9e0100000301010000006e0500000102708f02000000753e63ff7fc503c60e0000a3000000b8000000f70000007b000000b7000000fb040000030201020000000248656c6c6f2066726f6d2043616c67617279546f53706163652046726f6e746965725361740000000000454e44004446df0c"),
+        (172776.580, 80, 14, "c2a28a000400000000000000000000000101535543434553533a2053657420636f6e666967207661723a2054434d445f726571756972655f756e697175655f747373656e7420746f3a203100056a0913"),
+        (197985.524, 138, 0, "c2a28a0001435453310200afd3b301d00100004155a86f9e010000030111000e00700500000102998f020000007d3e63ff7fda03c60e0000a3000000a9000000e200000094000000ce0000002d050000030201020000000248656c6c6f2066726f6d2043616c67617279546f53706163652046726f6e746965725361740000000000454e44001d5c3a0d"),
+        (218455.718, 138, 0, "c2a28a0001435453310100b623b4015003000048a5a86f9e01000003011a001500710500000102ad8f02000000783e63ff7fd103c60e0000a30000009d000000d700000081000000bb0000002d050000030201020000000248656c6c6f2066726f6d2043616c67617279546f53706163652046726f6e746965725361740000000000454e440075dd8880"),
+        (238965.063, 138, 0, "c2a28a0001435453310200b973b4013f0300004bf5a86f9e010000030123001d00720500000102c18f02000000793e63ff7fde03c60e0000a30000007f000000c200000083000000c100000046050000030201020000000248656c6c6f2066726f6d2043616c67617279546f53706163652046726f6e746965725361740000000000454e4400e5846979"),
+        (259412.248, 138, 2, "c2a28a0001435453310100b1c3b401b40400004345a96f9e01000003012c002500730500000102d58f020000007a3e63ff7ff703c60e0000a30000007b000000b90000007f000000b700000046050000030201020000000248656c6c6f2066726f6d2043616c67617279546f53706163652046726f6e746965725361740000000000454e4400b57f31c3"),
+        (273731.629, 74, 0, "c2a28a000400000000000000000100000101436f756c64206e6f742073657420636f6e666967207661723a2054434d445f726571756972655f756e7175655f747373656e7400dd11bc0b"),
+        (279888.085, 138, 0, "c2a28a0001435453310200b013b501330600004295a96f9e010000030134002b00740500000102ea8f02000000753e63ff7fee03c60e0000a300000094000000d200000083000000c00000005f050000030201020000000248656c6c6f2066726f6d2043616c67617279546f53706163652046726f6e746965725361740000000000454e440026bb1e2e"),
+        (280035.626, 167, 0, "c2a28a0004803dc3709e01000000020001017b226e6f64655f74797065223a31302c22696e746572666163655f76657273696f6e223a372c226d616a6f725f6669726d776172655f76657273696f6e223a372c226d696e6f725f6669726d776172655f76657273696f6e223a31342c227365636f6e64735f73696e63655f73746172747570223a33383931372c226d735f706173745f7365636f6e64223a3231347d001ba28271"),
+    ];
+
+    assert_pinned_good_frames(
+        "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/5/28/17/14183111/satnogs_14183111_2026-05-28T17-32-37.ogg",
+        &good_frames(raw),
     );
 }
