@@ -43,14 +43,14 @@ impl std::fmt::Display for CheckVerdict {
         match self {
             CheckVerdict::Pass => write!(f, "PASS — audio looks decodable"),
             CheckVerdict::Warn(msgs) => {
-                write!(f, "WARN — proceed with caution:\n")?;
+                writeln!(f, "WARN — proceed with caution:")?;
                 for m in msgs {
                     writeln!(f, "  ⚠  {}", m)?;
                 }
                 Ok(())
             }
             CheckVerdict::Fail(msgs) => {
-                write!(f, "FAIL — decode unlikely:\n")?;
+                writeln!(f, "FAIL — decode unlikely:")?;
                 for m in msgs {
                     writeln!(f, "  ✗  {}", m)?;
                 }

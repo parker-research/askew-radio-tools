@@ -176,6 +176,7 @@ impl GfTables {
         index_of[0] = A0;
 
         let mut x: u16 = 1;
+        #[allow(clippy::needless_range_loop)]
         for i in 0..255usize {
             alpha_to[i] = x as u8;
             index_of[x as usize] = i as u8;
@@ -230,8 +231,8 @@ fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize) -> i32 {
                 s[i] = byte;
             } else {
                 s[i] = byte
-                    ^ alpha_to[modnn(index_of[s[i] as usize] as i32 + (FCR + i as i32) * PRIM)
-                        as usize];
+                    ^ alpha_to
+                        [modnn(index_of[s[i] as usize] as i32 + (FCR + i as i32) * PRIM) as usize];
             }
         }
     }
@@ -280,7 +281,7 @@ fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize) -> i32 {
                     t[i + 1] = lambda[i + 1];
                 }
             }
-            if 2 * el <= r - 1 {
+            if 2 * el < r {
                 el = r - el;
                 for i in 0..=NROOTS {
                     b[i] = if lambda[i] == 0 {
@@ -409,8 +410,7 @@ pub const ASM_FRAME_LEN_BYTES: usize = HEADER_LEN + NN;
 pub fn ax100_asm_golay_decode(
     frame: &[u8; ASM_FRAME_LEN_BYTES],
 ) -> Result<(Vec<u8>, u32), DecodeError> {
-    let mut header =
-        ((frame[0] as u32) << 16) | ((frame[1] as u32) << 8) | frame[2] as u32;
+    let mut header = ((frame[0] as u32) << 16) | ((frame[1] as u32) << 8) | frame[2] as u32;
     golay24_decode(&mut header)?;
 
     let frame_len = (header & 0xff) as i32;
@@ -514,7 +514,7 @@ mod tests {
         let data = 0x055u32;
         let encoded = golay_encode(data);
         // Flip 7 widely spread bits - well beyond the 3-bit correction radius.
-        let mut corrupted = encoded ^ 0b1010_1010_1010_1010_101;
+        let mut corrupted = encoded ^ 0b101_0101_0101_0101_0101;
         assert!(golay24_decode(&mut corrupted).is_err());
     }
 
@@ -576,8 +576,7 @@ mod tests {
         // Corrupt one transmitted (scrambled) byte inside the codeword.
         frame[HEADER_LEN + 50] ^= 0x5A;
 
-        let (payload, corrected) =
-            ax100_asm_golay_decode(&frame).expect("should correct 1 error");
+        let (payload, corrected) = ax100_asm_golay_decode(&frame).expect("should correct 1 error");
         assert!(payload.iter().all(|&b| b == 0));
         assert_eq!(corrected, 1);
     }

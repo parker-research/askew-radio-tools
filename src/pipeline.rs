@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use serde::Serialize;
 
 use crate::audio::AudioSamples;
-use crate::{audio, dsp, fec, framing, DecodeError};
+use crate::{DecodeError, audio, dsp, fec, framing};
 
 /// One decoded AX100 Mode 5 / CSP beacon frame, ready to be serialised as a
 /// JSONL record.
@@ -48,8 +48,7 @@ pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<BeaconRecord> {
         let raw_frames = framing::find_frames(&bitstream.bits);
 
         for raw in &raw_frames {
-            let (payload, rs_corrected_error_count) = match fec::ax100_asm_golay_decode(&raw.data)
-            {
+            let (payload, rs_corrected_error_count) = match fec::ax100_asm_golay_decode(&raw.data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
