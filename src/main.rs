@@ -1,4 +1,4 @@
-//! Command-line entry point for the AX100 Mode 5 (CSP) beacon decoder.
+//! Command-line entry point for the AX100 ASM+Golay (CSP) beacon decoder.
 //!
 //! Usage:
 //!   ax100-radio-csp-decoder <audio_file.wav|.ogg> [more files...]
@@ -13,7 +13,7 @@ use ax100_radio_csp_decoder::{audio_check, pipeline};
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(about = "AX100 Mode 5 (CSP) beacon decoder — emits JSONL to stdout")]
+#[command(about = "AX100 ASM+Golay (CSP) beacon decoder — emits JSONL to stdout")]
 struct Cli {
     /// Audio files to decode (.wav or .ogg), already Doppler-corrected.
     #[arg(required = true)]

@@ -13,4 +13,7 @@ pub enum DecodeError {
 
     #[error("Reed-Solomon decode failed — frame has invalid LEN byte or >16 byte errors")]
     ReedSolomonFailed,
+
+    #[error("Golay(24,12) decode failed — length header has >3 bit errors")]
+    GolayFailed,
 }

@@ -1,15 +1,15 @@
-//! AX100 Mode 5 (Reed-Solomon / CSP) beacon decoder for SatNOGS audio
-//! captures.
+//! AX100 "ASM+Golay" beacon decoder for SatNOGS audio captures
+//! (FRONTIERSAT / NORAD 69015 config: `framing: AX100 ASM+Golay`,
+//! `scrambler: CCSDS`, 9600 baud, 3200 Hz deviation).
 //!
 //! Implements the full decode chain, closely ported from gr-satellites'
-//! `ax100_deframer(mode='RS')` + `ax100_decode`:
-//!   Audio (WAV/OGG) → FM discriminator → LPF → symbol timing →
-//!   bit decisions → additive descrambler → syncword search →
+//! `ax100_deframer(mode='ASM')` + `u482c_decode`:
+//!   Audio (WAV/OGG) → LPF → symbol timing → bit decisions →
+//!   syncword search → Golay(24,12) length header → CCSDS derandomize →
 //!   Reed-Solomon (255,223) → CSP frame → CSP CRC-32C check
 
 pub mod audio;
 pub mod audio_check;
-pub mod descramble;
 pub mod dsp;
 pub mod error;
 pub mod fec;

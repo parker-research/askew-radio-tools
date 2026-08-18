@@ -1,20 +1,44 @@
-//! Reed-Solomon decoding and CSP-level CRC verification for AX100 Mode 5.
+//! FEC decoding and CSP-level CRC verification for AX100 "ASM+Golay" mode
+//! (`framing: AX100 ASM+Golay`, `scrambler: CCSDS` in gr-satellites YAML —
+//! this is FRONTIERSAT's mode).
+//!
+//! Ported closely from gr-satellites' `u482c_decode` block
+//! (`lib/u482c_decode_impl.cc`), as invoked by `ax100_deframer` for
+//! `mode='ASM'`: `u482c_decode(verbose, viterbi=0, scrambler=(1 if
+//! CCSDS else 0), rs=1)` — i.e. Viterbi is always forced off, RS is
+//! always forced on, and the scrambler follows the satellite's YAML.
+//!
+//! Frame layout (the 258 bytes captured immediately after the syncword by
+//! `sync_to_pdu_packed(packlen=258, ...)`):
+//! ```text
+//! byte 0..3:   Golay(24,12) header — NOT descrambled, NOT RS-corrected
+//! byte 3..258: payload region:
+//!                1. (Viterbi — always skipped for ax100_deframer)
+//!                2. CCSDS-derandomize in place, first `frame_len` bytes
+//!                3. RS(255,223) decode in place, pad = 255 - frame_len
+//!                4. output = first (frame_len - 32) bytes
+//! ```
+//! The Golay-corrected header's low 12 bits are `[frame_len: 8][viterbi
+//! flag][scrambler flag][RS flag]`; `ax100_deframer`'s ASM path ignores the
+//! viterbi/scrambler/RS flag bits and uses its own fixed configuration
+//! instead (`lib/u482c_decode_impl.cc`'s `msg_handler`).
 //!
 //! The Reed-Solomon decoder is a close port of Phil Karn's `decode_rs_8`
-//! (`libfec`, as vendored into gr-satellites at `lib/libfec/decode_rs_8.c`
-//! + `decode_rs.h`), with the fixed CCSDS (255,223) parameters from
-//! `lib/libfec/fixed.h`:
+//! (`libfec`, vendored into gr-satellites at `lib/libfec/decode_rs_8.c` +
+//! `decode_rs.h`), with the fixed CCSDS (255,223) parameters from
+//! `lib/libfec/fixed.h`: `NN=255`, `NROOTS=32`, `FCR=112`, `PRIM=11` (note:
+//! *not* consecutive roots), GF(2^8) poly `x^8+x^7+x^2+x+1` (`0x187`). Both
+//! AX100 modes share this exact codec (`ax100_decode_impl.cc` for RS mode
+//! and `u482c_decode_impl.cc` for ASM mode both call `decode_rs_8`
+//! directly — no dual-basis conversion needed).
 //!
-//!   - `NN=255`, `NROOTS=32` (32 parity bytes, corrects up to 16 errors)
-//!   - `FCR=112`, `PRIM=11` (note: *not* consecutive roots — this is the
-//!     detail that's easy to get wrong when porting from a "normal" RS
-//!     decoder)
-//!   - GF(2^8) generator polynomial `x^8+x^7+x^2+x+1` (`0x187`)
+//! The Golay(24,12) decoder is a literal port of `lib/golay24.c`'s
+//! syndrome-decoding algorithm (Morelos-Zaragoza, *The Art of Error
+//! Correcting Coding*, §2.2.3).
 //!
-//! `ax100_decode_impl.cc`'s `msg_handler` calls `decode_rs_8` directly (not
-//! `decode_rs_ccsds`), i.e. **no dual-basis conversion** — the AX100 modem
-//! already produces/expects the conventional basis, so we don't need the
-//! `Taltab`/`Tal1tab` transform either.
+//! The CCSDS derandomizer is a literal port of `lib/randomizer.c`'s
+//! `ccsds_generate_sequence`/`ccsds_xor_sequence` (polynomial
+//! `x^8+x^7+x^5+x^3+1`, all-ones seed, regenerated fresh per frame).
 //!
 //! CSP-level CRC verification (`crc_pass`) mirrors gr-satellites'
 //! `crcs.crc32c()` helper (`python/crcs.py`), which is `libcsp`'s CRC32C
@@ -22,6 +46,111 @@
 //! flag bit is set.
 
 use crate::DecodeError;
+
+// ---------------------------------------------------------------------------
+// Golay(24,12) decoder (port of lib/golay24.c)
+// ---------------------------------------------------------------------------
+
+const GOLAY_N: usize = 12;
+const GOLAY_H: [u32; GOLAY_N] = [
+    0x8008ed, 0x4001db, 0x2003b5, 0x100769, 0x080ed1, 0x040da3, 0x020b47, 0x01068f, 0x008d1d,
+    0x004a3b, 0x002477, 0x001ffe,
+];
+
+fn golay_b(i: usize) -> u32 {
+    GOLAY_H[i] & 0xfff
+}
+
+/// Decode a 24-bit Golay(24,12) codeword in place. Returns the number of
+/// corrected bit errors (0-3) on success, or `Err` if uncorrectable (≥4
+/// errors). The corrected word's low 12 bits are the message; see
+/// `lib/golay24.c`'s `encode_golay24` for the encode-side convention
+/// (`*data = (parity & 0xfff) << 12 | message`).
+fn golay24_decode(data: &mut u32) -> Result<u32, DecodeError> {
+    let r = *data;
+
+    // Step 1: s = H*r
+    let mut s: u32 = 0;
+    for h in GOLAY_H.iter() {
+        s <<= 1;
+        s |= (h & r).count_ones() & 1;
+    }
+
+    // Step 2: if w(s) <= 3, e = (s, 0)
+    if s.count_ones() <= 3 {
+        let e = s << GOLAY_N;
+        *data = r ^ e;
+        return Ok(e.count_ones());
+    }
+
+    // Step 3: if w(s ^ B(i)) <= 2, e = (s ^ B(i), e_{i+1})
+    for i in 0..GOLAY_N {
+        let cand = s ^ golay_b(i);
+        if cand.count_ones() <= 2 {
+            let e = (cand << GOLAY_N) | (1 << (GOLAY_N - i - 1));
+            *data = r ^ e;
+            return Ok(e.count_ones());
+        }
+    }
+
+    // Step 4: q = B*s
+    let mut q: u32 = 0;
+    for i in 0..GOLAY_N {
+        q <<= 1;
+        q |= (golay_b(i) & s).count_ones() & 1;
+    }
+
+    // Step 5: if w(q) <= 3, e = (0, q)
+    if q.count_ones() <= 3 {
+        let e = q;
+        *data = r ^ e;
+        return Ok(e.count_ones());
+    }
+
+    // Step 6: if w(q ^ B(i)) <= 2, e = (e_{i+1}, q ^ B(i))
+    for i in 0..GOLAY_N {
+        let cand = q ^ golay_b(i);
+        if cand.count_ones() <= 2 {
+            let e = (1 << (2 * GOLAY_N - i - 1)) | cand;
+            *data = r ^ e;
+            return Ok(e.count_ones());
+        }
+    }
+
+    // Step 7: uncorrectable
+    Err(DecodeError::GolayFailed)
+}
+
+// ---------------------------------------------------------------------------
+// CCSDS randomizer (port of lib/randomizer.c)
+// ---------------------------------------------------------------------------
+
+/// Generate `len` bytes of the CCSDS pseudo-random sequence
+/// (`h(x) = x^8+x^7+x^5+x^3+1`, all-ones seed), MSB-first per byte. This is
+/// a literal (Fibonacci-LFSR) port of `ccsds_generate_sequence`, always
+/// starting fresh — `u482c_decode` regenerates/reuses this from index 0
+/// for every frame, never continuing state across frames.
+fn ccsds_sequence(len: usize) -> Vec<u8> {
+    let mut x = [1u8; 9];
+    let mut seq = vec![0u8; len];
+    for i in 0..len * 8 {
+        seq[i / 8] |= x[1] << (7 - (i % 8));
+        let fb = x[8] ^ x[6] ^ x[4] ^ x[1];
+        for k in 1..8 {
+            x[k] = x[k + 1];
+        }
+        x[8] = fb;
+    }
+    seq
+}
+
+/// XOR `data` in place against a freshly generated CCSDS sequence.
+fn ccsds_derandomize(data: &mut [u8]) {
+    let seq = ccsds_sequence(data.len());
+    for (byte, mask) in data.iter_mut().zip(seq.iter()) {
+        *byte ^= mask;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CCSDS GF(2^8) tables (see lib/libfec/ccsds.c)
@@ -261,32 +390,56 @@ fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize) -> i32 {
     count as i32
 }
 
-/// Decode one AX100 Mode 5 frame (the 256 bytes following the syncword:
-/// `[LEN, ...codeword tail]`), mirroring `ax100_decode_impl::msg_handler`.
+// ---------------------------------------------------------------------------
+// Top-level ASM+Golay frame decode (port of u482c_decode_impl::msg_handler)
+// ---------------------------------------------------------------------------
+
+const HEADER_LEN: usize = 3;
+
+/// Total bytes captured after the syncword for AX100 ASM+Golay framing
+/// (`packlen=258` in gr-satellites' `sync_to_pdu_packed`).
+pub const ASM_FRAME_LEN_BYTES: usize = HEADER_LEN + NN;
+
+/// Decode one AX100 ASM+Golay frame (the 258 bytes following the syncword),
+/// mirroring `u482c_decode_impl::msg_handler` with `ax100_deframer`'s fixed
+/// configuration (Viterbi off, RS on, CCSDS scrambler on).
 ///
 /// Returns the recovered CSP frame bytes (RS parity stripped) and the
 /// number of symbol errors the RS decoder corrected.
-pub fn ax100_rs_decode(frame: &[u8; 256]) -> Result<(Vec<u8>, u32), DecodeError> {
-    let len_byte = frame[0] as i32;
-    let pad = 255 - len_byte + 1;
+pub fn ax100_asm_golay_decode(
+    frame: &[u8; ASM_FRAME_LEN_BYTES],
+) -> Result<(Vec<u8>, u32), DecodeError> {
+    let mut header =
+        ((frame[0] as u32) << 16) | ((frame[1] as u32) << 8) | frame[2] as u32;
+    golay24_decode(&mut header)?;
+
+    let frame_len = (header & 0xff) as i32;
+    // header bits 8/9/10 (viterbi/scrambler/RS flags) are intentionally
+    // ignored here, matching ax100_deframer's fixed viterbi=off, rs=on,
+    // scrambler=CCSDS-per-YAML configuration rather than the frame's
+    // self-described flags.
+
+    let pad = NN as i32 - frame_len;
     if !(0..=222).contains(&pad) {
         return Err(DecodeError::ReedSolomonFailed);
     }
+    let frame_len = frame_len as usize;
     let pad = pad as usize;
-    let real_len = NN - pad; // == len_byte - 1
-    if real_len < NROOTS {
+    if frame_len < NROOTS {
         return Err(DecodeError::ReedSolomonFailed);
     }
 
+    let mut packet = frame[HEADER_LEN..HEADER_LEN + frame_len].to_vec();
+    ccsds_derandomize(&mut packet);
+
     let gf = GfTables::new();
-    let mut data = frame[1..1 + real_len].to_vec();
-    let count = decode_rs8(&gf, &mut data, pad);
+    let count = decode_rs8(&gf, &mut packet, pad);
     if count < 0 {
         return Err(DecodeError::ReedSolomonFailed);
     }
 
-    let payload_len = real_len - NROOTS;
-    Ok((data[..payload_len].to_vec(), count as u32))
+    let payload_len = frame_len - NROOTS;
+    Ok((packet[..payload_len].to_vec(), count as u32))
 }
 
 // ---------------------------------------------------------------------------
@@ -323,36 +476,108 @@ pub fn csp_crc32c_check(frame: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn golay_encode(data12: u32) -> u32 {
+        let r = data12 & 0xfff;
+        let mut s: u32 = 0;
+        for h in GOLAY_H.iter() {
+            s <<= 1;
+            s |= (h & r).count_ones() & 1;
+        }
+        ((s & 0xfff) << GOLAY_N) | r
+    }
+
     #[test]
-    fn test_rs_decode_rejects_short_len_byte() {
-        let mut frame = [0u8; 256];
-        frame[0] = 10; // pad = 256-10 = 246 > 222 -> invalid
+    fn test_golay_roundtrip_no_errors() {
+        for data in [0u32, 1, 42, 0x123, 0xABC, 0xFFF] {
+            let encoded = golay_encode(data);
+            let mut w = encoded;
+            let errors = golay24_decode(&mut w).expect("should decode cleanly");
+            assert_eq!(errors, 0);
+            assert_eq!(w & 0xfff, data);
+        }
+    }
+
+    #[test]
+    fn test_golay_corrects_up_to_3_bit_errors() {
+        let data = 0x2A5u32;
+        let encoded = golay_encode(data);
+        for mask in [0b1u32, 0b101, 0b10100001, 1 << 23] {
+            let mut corrupted = encoded ^ mask;
+            let errors = golay24_decode(&mut corrupted).expect("should correct <=3 bit errors");
+            assert_eq!(errors, mask.count_ones());
+            assert_eq!(corrupted & 0xfff, data);
+        }
+    }
+
+    #[test]
+    fn test_golay_rejects_too_many_errors() {
+        let data = 0x055u32;
+        let encoded = golay_encode(data);
+        // Flip 7 widely spread bits - well beyond the 3-bit correction radius.
+        let mut corrupted = encoded ^ 0b1010_1010_1010_1010_101;
+        assert!(golay24_decode(&mut corrupted).is_err());
+    }
+
+    #[test]
+    fn test_ccsds_sequence_deterministic_and_nonzero() {
+        let seq = ccsds_sequence(16);
+        assert!(seq.iter().any(|&b| b != 0));
+        assert_eq!(seq, ccsds_sequence(16));
+    }
+
+    #[test]
+    fn test_ccsds_derandomize_involution() {
+        let original = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 0x12, 0x34];
+        let mut data = original.clone();
+        ccsds_derandomize(&mut data);
+        ccsds_derandomize(&mut data);
+        assert_eq!(data, original);
+    }
+
+    fn make_header(frame_len: u8) -> [u8; HEADER_LEN] {
+        let word = golay_encode(frame_len as u32);
+        [(word >> 16) as u8, (word >> 8) as u8, word as u8]
+    }
+
+    #[test]
+    fn test_asm_decode_rejects_short_frame_len() {
+        let mut frame = [0u8; ASM_FRAME_LEN_BYTES];
+        frame[..HEADER_LEN].copy_from_slice(&make_header(10)); // pad=245 > 222
         assert!(matches!(
-            ax100_rs_decode(&frame),
+            ax100_asm_golay_decode(&frame),
             Err(DecodeError::ReedSolomonFailed)
         ));
     }
 
     #[test]
-    fn test_rs_decode_all_zero_codeword() {
-        // All-zero data is trivially a valid codeword (zero syndrome).
-        let mut frame = [0u8; 256];
-        frame[0] = 255; // pad=1, real_len=254, payload_len=254-32=222
-        let (payload, corrected) = ax100_rs_decode(&frame).expect("should decode cleanly");
-        assert_eq!(payload.len(), 222);
+    fn test_asm_decode_all_zero_codeword() {
+        // frame_len=255 (max): pad=0, payload_len=255-32=223.
+        // The all-zero RS codeword derandomizes to the CCSDS sequence
+        // itself, which is *not* all-zero, so instead we scramble a
+        // known-valid (all-zero) codeword forward so that after
+        // derandomization inside the decoder we get back to all-zero.
+        let mut frame = [0u8; ASM_FRAME_LEN_BYTES];
+        frame[..HEADER_LEN].copy_from_slice(&make_header(255));
+        let seq = ccsds_sequence(255);
+        frame[HEADER_LEN..].copy_from_slice(&seq);
+
+        let (payload, corrected) = ax100_asm_golay_decode(&frame).expect("should decode cleanly");
+        assert_eq!(payload.len(), 223);
         assert!(payload.iter().all(|&b| b == 0));
         assert_eq!(corrected, 0);
     }
 
     #[test]
-    fn test_rs_decode_corrects_single_byte_error() {
-        // Build a valid all-zero codeword, corrupt one parity byte, and
-        // confirm the decoder both detects and repairs it.
-        let mut frame = [0u8; 256];
-        frame[0] = 255;
-        frame[50] ^= 0x5A; // corrupt one byte inside the codeword region
+    fn test_asm_decode_corrects_single_byte_error() {
+        let mut frame = [0u8; ASM_FRAME_LEN_BYTES];
+        frame[..HEADER_LEN].copy_from_slice(&make_header(255));
+        let seq = ccsds_sequence(255);
+        frame[HEADER_LEN..].copy_from_slice(&seq);
+        // Corrupt one transmitted (scrambled) byte inside the codeword.
+        frame[HEADER_LEN + 50] ^= 0x5A;
 
-        let (payload, corrected) = ax100_rs_decode(&frame).expect("should correct 1 error");
+        let (payload, corrected) =
+            ax100_asm_golay_decode(&frame).expect("should correct 1 error");
         assert!(payload.iter().all(|&b| b == 0));
         assert_eq!(corrected, 1);
     }

@@ -52,11 +52,41 @@ pub struct BitStream {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Run the full DSP front-end on a decoded audio buffer.
+/// A handful of Gardner loop-filter (proportional, integral) gain pairs to
+/// try when [`fm_discriminate_and_filter`]'s default doesn't lock onto a
+/// given capture. See [`gardner_ted`]'s comment on why a single fixed gain
+/// isn't robust across a whole multi-minute file: over millions of mostly-
+/// noise symbols the loop's phase error random-walks, so which gain
+/// happens to keep it well-aligned during any one real burst is
+/// essentially arbitrary. Trying several bandwidths and merging whatever
+/// each one manages to decode (deduplicated downstream) catches frames
+/// that any single fixed gain would miss.
+pub const GARDNER_GAIN_CANDIDATES: &[(f64, f64)] = &[
+    (0.00003, 0.000003),
+    (0.0001, 0.00001),
+    (0.00001, 0.000001),
+    (0.0003, 0.00003),
+    (0.000003, 0.0000003),
+];
+
+/// Run the full DSP front-end on a decoded audio buffer using the default
+/// (best-known) Gardner loop gains. See [`GARDNER_GAIN_CANDIDATES`] for
+/// running with alternate gains.
 ///
 /// `samples` must be mono f32 normalised to [-1.0, 1.0] at a sample rate
 /// high enough to represent 9600 baud (≥ 19200 Hz, typically 48000 Hz).
 pub fn fm_discriminate_and_filter(audio: &AudioSamples) -> BitStream {
+    let (alpha, beta) = GARDNER_GAIN_CANDIDATES[0];
+    fm_discriminate_and_filter_with_gains(audio, alpha, beta)
+}
+
+/// Same as [`fm_discriminate_and_filter`], but with explicit Gardner
+/// loop-filter gains (see [`GARDNER_GAIN_CANDIDATES`]).
+pub fn fm_discriminate_and_filter_with_gains(
+    audio: &AudioSamples,
+    alpha: f64,
+    beta: f64,
+) -> BitStream {
     let fs = audio.sample_rate as f64;
     let symbol_rate = 9600.0_f64;
 
@@ -65,7 +95,8 @@ pub fn fm_discriminate_and_filter(audio: &AudioSamples) -> BitStream {
     let filtered = lowpass_filter(&audio.samples, fs, lpf_cutoff);
 
     // 2. Gardner timing error detector + interpolated sampling
-    let (symbols, sample_positions, recovered_rate) = gardner_ted(&filtered, fs, symbol_rate);
+    let (symbols, sample_positions, recovered_rate) =
+        gardner_ted(&filtered, fs, symbol_rate, alpha, beta);
 
     // 3. Hard decision (slicer): positive deviation → 1, negative → 0
     let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
@@ -113,10 +144,14 @@ fn lowpass_filter(input: &[f32], fs: f64, cutoff_hz: f64) -> Vec<f32> {
 //
 // The loop filter is a simple PI controller:
 //   μ[k+1] = μ[k] + α·e[k] + β·∑e[k]
-//
-// Typical values for α and β at 9600 baud / 48 kHz: α≈0.01, β≈0.001.
 
-fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64) -> (Vec<f32>, Vec<f64>, f64) {
+fn gardner_ted(
+    input: &[f32],
+    fs: f64,
+    symbol_rate: f64,
+    alpha: f64,
+    beta: f64,
+) -> (Vec<f32>, Vec<f64>, f64) {
     let sps = fs / symbol_rate; // samples per symbol (e.g. 5.0 for 48000/9600)
 
     // The loop filter gains below are tuned assuming a roughly unit-
@@ -131,12 +166,21 @@ fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64) -> (Vec<f32>, Vec<f64>,
     let input: Vec<f32> = input.iter().map(|&x| x / norm).collect();
     let input = input.as_slice();
 
-    // Loop filter constants (normalised loop bandwidth ≈ 0.01)
-    let alpha = 0.01_f64; // proportional gain
-    let beta = 0.001_f64; // integral gain
+    // `alpha`/`beta` are deliberately much lower-bandwidth than a
+    // "textbook" Gardner loop (which would use something like
+    // alpha=0.01, beta=0.001): over a multi-minute capture (millions of
+    // symbols, almost all of it noise between brief real transmissions),
+    // a higher-bandwidth loop tracks the noise itself, and the resulting
+    // phase error random-walks far enough that by the time a real burst
+    // arrives its alignment is essentially arbitrary. A slow loop stays
+    // much closer to the true (very stable, crystal-derived) symbol clock
+    // throughout, at the cost of taking longer to pull in a large initial
+    // offset — an acceptable trade-off here since Doppler/clock offset is
+    // small and roughly constant relative to a strong noise floor. See
+    // [`GARDNER_GAIN_CANDIDATES`] for why callers may want to try more
+    // than one gain pair.
 
     let mut symbols: Vec<f32> = Vec::with_capacity(input.len() / sps as usize);
-    let mut mu = 0.0_f64; // fractional timing offset [0, 1)
     let mut int_err = 0.0_f64; // integrator state
 
     // Track the actual sampling positions to estimate recovered symbol rate
