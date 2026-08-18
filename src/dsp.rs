@@ -94,13 +94,26 @@ pub fn fm_discriminate_and_filter_with_gains(
     let lpf_cutoff = symbol_rate * 1.5; // 14 400 Hz
     let filtered = lowpass_filter(&audio.samples, fs, lpf_cutoff);
 
+    // The LPF is causal, so its output at sample index i reflects input
+    // energy from *earlier* in the signal — a fixed number of samples
+    // earlier, equal to the filter's group delay. `gardner_ted` reports
+    // symbol positions as indices into `filtered`'s timeline, which are
+    // otherwise a precise, direct measurement of the original audio
+    // timeline (see the module doc and `GARDNER_GAIN_CANDIDATES` comment);
+    // this is the one systematic (non-random) offset in that chain, so we
+    // subtract it back out before converting to real time.
+    let lpf_group_delay_samples = biquad_lowpass_group_delay_samples(fs, lpf_cutoff);
+
     // 2. Gardner timing error detector + interpolated sampling
     let (symbols, sample_positions, recovered_rate) =
         gardner_ted(&filtered, fs, symbol_rate, alpha, beta);
 
     // 3. Hard decision (slicer): positive deviation → 1, negative → 0
     let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
-    let bit_times_ms: Vec<f64> = sample_positions.iter().map(|&p| p / fs * 1000.0).collect();
+    let bit_times_ms: Vec<f64> = sample_positions
+        .iter()
+        .map(|&p| (p - lpf_group_delay_samples) / fs * 1000.0)
+        .collect();
 
     BitStream {
         bits,
@@ -127,6 +140,49 @@ fn lowpass_filter(input: &[f32], fs: f64, cutoff_hz: f64) -> Vec<f32> {
 
     let mut filter = DirectForm2Transposed::<f32>::new(coeffs);
     input.iter().map(|&s| filter.run(s)).collect()
+}
+
+/// Group delay (in samples) of the same Butterworth low-pass this module
+/// filters with, evaluated at DC.
+///
+/// An IIR filter's group delay isn't perfectly constant across frequency
+/// the way a linear-phase FIR's is, but a maximally-flat (Butterworth)
+/// low-pass stays close to flat through most of its passband, so a single
+/// representative value — the conventional choice being DC — is a good
+/// approximation of "the" delay for a signal whose energy sits below
+/// cutoff (as ours does: cutoff is 1.5× the symbol rate).
+///
+/// Computed analytically from the exact same Audio-EQ-Cookbook biquad
+/// coefficients `lowpass_filter` uses (via `biquad`'s own formulas, just
+/// evaluated in `f64` here for a cleaner analysis independent of the
+/// runtime filter's `f32` rounding — the difference between the two is far
+/// below anything else's precision floor in this pipeline): group delay is
+/// `-dφ/dω` of the filter's phase response, taken via a central-difference
+/// numerical derivative.
+fn biquad_lowpass_group_delay_samples(fs: f64, cutoff_hz: f64) -> f64 {
+    let coeffs = Coefficients::<f64>::from_params(
+        Type::LowPass,
+        fs.hz(),
+        cutoff_hz.hz(),
+        biquad::Q_BUTTERWORTH_F64,
+    )
+    .expect("LPF coefficient computation failed — check sample rate and cutoff values");
+
+    // Phase response of H(z) = (b0 + b1 z^-1 + b2 z^-2) / (1 + a1 z^-1 + a2 z^-2)
+    // at z = e^{jω}, ω in radians/sample.
+    let phase_at = |omega: f64| -> f64 {
+        let (s1, c1) = omega.sin_cos();
+        let (s2, c2) = (2.0 * omega).sin_cos();
+        let num_re = coeffs.b0 + coeffs.b1 * c1 + coeffs.b2 * c2;
+        let num_im = -(coeffs.b1 * s1 + coeffs.b2 * s2);
+        let den_re = 1.0 + coeffs.a1 * c1 + coeffs.a2 * c2;
+        let den_im = -(coeffs.a1 * s1 + coeffs.a2 * s2);
+        num_im.atan2(num_re) - den_im.atan2(den_re)
+    };
+
+    // Group delay = -dφ/dω, evaluated at DC via central difference.
+    let h = 1e-4_f64;
+    -(phase_at(h) - phase_at(-h)) / (2.0 * h)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +354,21 @@ mod tests {
             sample_rate,
             channels: 1,
         }
+    }
+
+    #[test]
+    fn test_lpf_group_delay_is_small_and_positive() {
+        // Sanity bounds: a causal 2nd-order filter's delay should be
+        // positive (output lags input) and, for a cutoff well above the
+        // signal band, small relative to one symbol period (5 samples at
+        // 48 kHz / 9600 baud).
+        let d = biquad_lowpass_group_delay_samples(48_000.0, 14_400.0);
+        eprintln!("LPF group delay = {d} samples");
+        assert!(d > 0.0, "group delay should be positive, got {d}");
+        assert!(
+            d < 5.0,
+            "group delay should be well under 1 symbol, got {d}"
+        );
     }
 
     #[test]
