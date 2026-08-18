@@ -81,9 +81,6 @@ pub struct AudioMetrics {
 /// Baud rate (from param list 5: baud = 9600).
 const BAUD: f32 = 9600.0;
 
-/// Frequency deviation: baud × (1/1.5) / 2 = 3200 Hz (modindex auto = 0.667).
-const FREQ_DEV: f32 = BAUD / 1.5 / 2.0; // 3200 Hz
-
 /// AX100 RX bandwidth: 1.5 × baud = 14 400 Hz.
 const SIGNAL_BW: f32 = BAUD * 1.5; // 14 400 Hz
 
@@ -291,6 +288,9 @@ mod tests {
     use super::*;
     use crate::audio::AudioSamples;
     use std::f32::consts::TAU;
+
+    /// Frequency deviation: baud × (1/1.5) / 2 = 3200 Hz (modindex auto = 0.667).
+    const FREQ_DEV: f32 = BAUD / 1.5 / 2.0; // 3200 Hz
 
     fn make_tone(fs: u32, freq: f32, amp: f32, secs: f32) -> AudioSamples {
         let n = (fs as f32 * secs) as usize;

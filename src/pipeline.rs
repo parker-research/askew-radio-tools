@@ -13,11 +13,11 @@ use crate::{audio, dsp, fec, framing, DecodeError};
 #[derive(Debug, Clone, Serialize)]
 pub struct BeaconRecord {
     pub filename: String,
-    pub data_hex: String,
     pub data_length_bytes: usize,
-    pub start_time_in_file_ms: f64,
+    pub time_in_file_ms: f64,
     pub rs_corrected_error_count: u32,
     pub crc_pass: bool,
+    pub data_hex: String,
 }
 
 /// Run the full decode pipeline on one audio file and return every frame
@@ -59,24 +59,26 @@ pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<BeaconRecord> {
             }
 
             let crc_pass = fec::csp_crc32c_check(&payload);
-            let start_time_in_file_ms = bitstream
+            let time_in_file_ms = bitstream
                 .bit_times_ms
                 .get(raw.sync_bit_offset)
                 .copied()
                 .unwrap_or(0.0);
+            // Round to microsecond precision (i.e. the nearest 0.001 ms).
+            let time_in_file_ms = (time_in_file_ms * 1000.0).round() / 1000.0;
 
             records.push(BeaconRecord {
                 filename: filename.to_string(),
-                data_hex: hex_encode(&payload),
                 data_length_bytes: payload.len(),
-                start_time_in_file_ms,
+                time_in_file_ms,
                 rs_corrected_error_count,
                 crc_pass,
+                data_hex: hex_encode(&payload),
             });
         }
     }
 
-    records.sort_by(|a, b| a.start_time_in_file_ms.total_cmp(&b.start_time_in_file_ms));
+    records.sort_by(|a, b| a.time_in_file_ms.total_cmp(&b.time_in_file_ms));
     records
 }
 

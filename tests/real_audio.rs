@@ -73,7 +73,7 @@ fn test_satnogs_observation_14813295_decodes_at_least_10_good_frames() {
     for r in &good {
         eprintln!(
             "  t={:>9.1}ms  {}B  rs_corrected={}  {}",
-            r.start_time_in_file_ms, r.data_length_bytes, r.rs_corrected_error_count, r.data_hex
+            r.time_in_file_ms, r.data_length_bytes, r.rs_corrected_error_count, r.data_hex
         );
     }
 

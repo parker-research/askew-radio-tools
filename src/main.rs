@@ -5,9 +5,10 @@
 //!
 //! Each already-doppler-corrected audio file is decoded independently.
 //! Decoded CSP frames are written to stdout as JSONL (one JSON object per
-//! line, fields: filename, data_hex, data_length_bytes,
-//! start_time_in_file_ms, rs_corrected_error_count, crc_pass). All other
-//! diagnostics go to stderr so stdout stays valid JSONL.
+//! line, fields: data_length_bytes, time_in_file_ms,
+//! rs_corrected_error_count, crc_pass, data_hex — plus filename if
+//! `--show-filename` is passed). All other diagnostics go to stderr so
+//! stdout stays valid JSONL.
 
 use ax100_radio_csp_decoder::{audio_check, pipeline};
 use clap::Parser;
@@ -18,6 +19,10 @@ struct Cli {
     /// Audio files to decode (.wav or .ogg), already Doppler-corrected.
     #[arg(required = true)]
     audio_files: Vec<String>,
+
+    /// Include the source filename in each JSONL record (excluded by default).
+    #[arg(long)]
+    show_filename: bool,
 }
 
 fn main() {
@@ -25,7 +30,7 @@ fn main() {
     let mut had_error = false;
 
     for path in &cli.audio_files {
-        if let Err(e) = decode_and_print(path) {
+        if let Err(e) = decode_and_print(path, cli.show_filename) {
             had_error = true;
             eprintln!("{path}: error: {e}");
         }
@@ -36,7 +41,7 @@ fn main() {
     }
 }
 
-fn decode_and_print(path: &str) -> Result<(), ax100_radio_csp_decoder::DecodeError> {
+fn decode_and_print(path: &str, show_filename: bool) -> Result<(), ax100_radio_csp_decoder::DecodeError> {
     let audio = ax100_radio_csp_decoder::audio::load_audio(path)?;
     let metrics = audio_check::check(&audio);
     eprintln!("{path}: {}", metrics.verdict);
@@ -50,7 +55,15 @@ fn decode_and_print(path: &str) -> Result<(), ax100_radio_csp_decoder::DecodeErr
         // A single serde_json struct can't fail to serialize here (no
         // maps/floats that are NaN/inf), so this is safe to unwrap.
         use std::io::Write;
-        writeln!(handle, "{}", serde_json::to_string(record).unwrap())
+        let mut value = serde_json::to_value(record).unwrap();
+        if !show_filename {
+            // `.remove()` is a `swap_remove` under the `preserve_order`
+            // feature (moves the last field into "filename"'s slot), which
+            // would scramble the remaining field order — `shift_remove`
+            // keeps it intact.
+            value.as_object_mut().unwrap().shift_remove("filename");
+        }
+        writeln!(handle, "{}", serde_json::to_string(&value).unwrap())
             .expect("failed to write to stdout");
     }
 

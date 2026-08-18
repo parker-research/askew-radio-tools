@@ -184,7 +184,6 @@ fn gardner_ted(
     let mut int_err = 0.0_f64; // integrator state
 
     // Track the actual sampling positions to estimate recovered symbol rate
-    let mut last_sample_pos = 0.0_f64;
     let mut sample_positions: Vec<f64> = Vec::new();
 
     // We need the previous and previous-mid samples for the TED error.
