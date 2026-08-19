@@ -77,6 +77,14 @@ pub struct BitStream {
     /// Timestamp of each bit in `bits` (same index), in milliseconds from
     /// the start of the input audio file.
     pub bit_times_ms: Vec<f64>,
+    /// Relative signal strength at each bit in `bits` (same index), in dB.
+    /// Measured as the local RMS amplitude (one symbol period wide) of the
+    /// signal *before* AGC normalisation — AGC removes absolute level, so
+    /// this is the only point in the chain where the original received
+    /// strength is still present. Not calibrated to an absolute RF power;
+    /// only meaningful as a relative "louder vs. quieter" comparison
+    /// between packets.
+    pub bit_rssi_db: Vec<f64>,
     /// Estimated symbol rate after timing recovery (Hz). Should be ≈ 9600.
     pub recovered_symbol_rate: f64,
 }
@@ -169,7 +177,11 @@ pub fn fm_discriminate_and_filter_multi_bw(audio: &AudioSamples, bws: &[f64]) ->
 /// bandwidth used in step 4.
 struct FrontEnd {
     agced: Vec<f32>,
+    /// Matched-filtered, DC-blocked signal *before* AGC normalisation —
+    /// kept around only to measure [`BitStream::bit_rssi_db`] from.
+    dc_blocked: Vec<f32>,
     fs: f64,
+    sps: f64,
     /// See the comment in [`bitstream_from_front_end`] on why this is
     /// tracked and subtracted back out.
     total_delay_samples: f64,
@@ -196,7 +208,9 @@ impl FrontEnd {
 
         FrontEnd {
             agced,
+            dc_blocked,
             fs,
+            sps,
             total_delay_samples: boxcar_delay_samples + dc_delay_samples,
         }
     }
@@ -219,12 +233,36 @@ fn bitstream_from_front_end(front_end: &FrontEnd, clk_bw: f64) -> BitStream {
         .iter()
         .map(|&p| (p - front_end.total_delay_samples) / front_end.fs * 1000.0)
         .collect();
+    let bit_rssi_db: Vec<f64> = sample_positions
+        .iter()
+        .map(|&p| local_rssi_db(&front_end.dc_blocked, p, front_end.sps))
+        .collect();
 
     BitStream {
         bits,
         bit_times_ms,
+        bit_rssi_db,
         recovered_symbol_rate: recovered_rate,
     }
+}
+
+/// RMS amplitude of `signal` over a one-symbol-period window centred on
+/// `pos` (a fractional sample index), expressed in dB (`20*log10(rms)`).
+/// This is the shared building block behind [`BitStream::bit_rssi_db`] for
+/// both front-ends.
+fn local_rssi_db(signal: &[f32], pos: f64, sps: f64) -> f64 {
+    let half_window = (sps / 2.0).max(1.0);
+    let lo = ((pos - half_window).floor().max(0.0)) as usize;
+    let hi = ((pos + half_window).ceil() as usize).min(signal.len());
+    if lo >= hi {
+        // No samples in range (e.g. `pos` right at the signal's edge) — a
+        // finite silence floor, not `-inf`, since this value flows into
+        // JSON output (`serde_json` can't serialize non-finite floats).
+        return -240.0;
+    }
+    let sum_sq: f64 = signal[lo..hi].iter().map(|&x| (x as f64) * (x as f64)).sum();
+    let rms = (sum_sq / (hi - lo) as f64).sqrt();
+    20.0 * (rms + 1e-12).log10()
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +595,10 @@ pub fn fm_discriminate_and_filter_mueller_muller(audio: &AudioSamples) -> BitStr
         .iter()
         .map(|&p| (p - total_delay_samples) / fs * 1000.0)
         .collect();
+    let bit_rssi_db: Vec<f64> = sample_positions
+        .iter()
+        .map(|&p| local_rssi_db(&dc_blocked, p, sps))
+        .collect();
 
     let recovered_rate = if sample_positions.len() > 1 {
         let mean_sps = (sample_positions.last().unwrap() - sample_positions[0])
@@ -569,6 +611,7 @@ pub fn fm_discriminate_and_filter_mueller_muller(audio: &AudioSamples) -> BitStr
     BitStream {
         bits,
         bit_times_ms,
+        bit_rssi_db,
         recovered_symbol_rate: recovered_rate,
     }
 }

@@ -26,6 +26,13 @@ pub struct BeaconRecord {
     /// trailer. See [`fec::csp_crc32c_check`] for why this doesn't depend
     /// on the CSP header's `crc` flag.
     pub crc_pass: Option<bool>,
+    /// Relative received signal strength over the frame (syncword through
+    /// payload), in dB. Measured from the demodulator's local signal
+    /// amplitude just before AGC normalisation — see
+    /// [`dsp::BitStream::bit_rssi_db`] — so it isn't calibrated to an
+    /// absolute RF power, but is comparable between packets within (and
+    /// across) files: a higher value means a relatively stronger receive.
+    pub rssi_db: f64,
     pub data_hex: String,
 }
 
@@ -102,6 +109,10 @@ fn decode_bitstream(
         // Round to microsecond precision (i.e. the nearest 0.001 ms).
         let time_in_file_ms = (time_in_file_ms * 1000.0).round() / 1000.0;
 
+        let frame_end_bit = (raw.sync_bit_offset + 32 + raw.data.len() * 8)
+            .min(bitstream.bit_rssi_db.len());
+        let rssi_db = mean_rssi_db(&bitstream.bit_rssi_db[raw.sync_bit_offset..frame_end_bit]);
+
         records.push(BeaconRecord {
             filename: filename.to_string(),
             data_length_bytes: decoded.payload.len(),
@@ -109,9 +120,27 @@ fn decode_bitstream(
             rs_corrected_error_count: decoded.rs_corrected_error_count,
             rs_correctable: decoded.rs_correctable,
             crc_pass,
+            rssi_db,
             data_hex: hex_encode(&decoded.payload),
         });
     }
+}
+
+/// Average a frame's per-bit RSSI (dB) values, rounded to 0.01 dB. Averages
+/// in the power domain (mean of the underlying RMS-squared values, not a
+/// plain mean of dB) since dB is already a log quantity.
+fn mean_rssi_db(bit_rssi_db: &[f64]) -> f64 {
+    if bit_rssi_db.is_empty() {
+        // Finite silence floor, not `-inf` — this value flows into JSON
+        // output (`serde_json` can't serialize non-finite floats).
+        return -240.0;
+    }
+    let mean_power: f64 = bit_rssi_db
+        .iter()
+        .map(|&db| 10f64.powf(db / 10.0))
+        .sum::<f64>()
+        / bit_rssi_db.len() as f64;
+    (10.0 * mean_power.log10() * 100.0).round() / 100.0
 }
 
 fn hex_encode(data: &[u8]) -> String {
