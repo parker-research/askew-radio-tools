@@ -442,6 +442,178 @@ fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64, clk_bw: f64) -> (Vec<f3
 }
 
 // ---------------------------------------------------------------------------
+// Alternate front-end: Mueller-Müller decision-directed timing recovery
+// ---------------------------------------------------------------------------
+//
+// A structurally different demod chain, ported from `simple_sat_ops`'
+// `modem_pcm16_to_bits` (`src/dsp/modem.c`) — an independently-developed
+// sister decoder for this same AX100/FrontierSat downlink. Benchmarking it
+// (via its `rx_replay --forensics-report` CLI) against this decoder on the
+// same real captures found it recovers real frames the chain above misses
+// *entirely*: on one file, 5 of 6 repeat transmissions of a short "Could
+// not set config var" message never produced even a syncword hit for us,
+// at any of the [`CLK_BW_CANDIDATES`] bandwidths — not a marginal RS
+// failure, a total miss.
+//
+// The chain differs in several structural ways, not just tuning:
+//   - DC-block runs *before* the matched filter (the chain above runs it
+//     after).
+//   - AGC is a single static whole-file RMS, not a running/adaptive one.
+//   - Timing recovery is Mueller-Müller (decision-directed: error =
+//     sign(y[k-1])·y[k] - sign(y[k])·y[k-1]) with a pure proportional loop,
+//     not Gardner with a 2nd-order PI loop.
+//   - The strobe sample is linearly interpolated, not PFB-interpolated.
+//
+// None of these individually looks obviously "better" than the GNU Radio-
+// matching chain above — this is a genuinely different algorithm, with a
+// different error S-curve and different susceptibility to whatever made
+// those particular bursts hard to track — which is exactly why running it
+// as an additional ensemble member (rather than guessing which specific
+// piece of the difference mattered) recovers frames the primary chain
+// can't reach no matter how its parameters are tuned. See
+// [`crate::pipeline::decode_audio`] for how it's merged in.
+
+/// `modem.c`'s DC-block filter coefficient (`alpha = 0.995f`, "≈ 40 Hz
+/// -3dB" at 48 kHz).
+const MM_DC_BLOCK_ALPHA: f32 = 0.995;
+/// `modem.c`'s Mueller-Müller loop proportional gain (`Kp = 0.10`).
+const MM_LOOP_KP: f64 = 0.10;
+/// `modem.c`'s per-step clamp, as a fraction of `sps` (`max_step =
+/// sps_d * 0.25`).
+const MM_MAX_STEP_FRACTION: f64 = 0.25;
+
+/// Run the alternate Mueller-Müller front-end described above. Meant to be
+/// merged with (not replace) [`fm_discriminate_and_filter`]'s output — see
+/// the module comment above.
+pub fn fm_discriminate_and_filter_mueller_muller(audio: &AudioSamples) -> BitStream {
+    let fs = audio.sample_rate as f64;
+    let sps = fs / SYMBOL_RATE_HZ;
+
+    // 1. DC-block (1-pole HPF) — ahead of the matched filter here, unlike
+    // the primary chain.
+    let dc_blocked = one_pole_dc_block(&audio.samples, MM_DC_BLOCK_ALPHA);
+    let dc_delay_samples = one_pole_dc_block_group_delay_samples(fs);
+
+    // 2. Static whole-file RMS AGC (not adaptive/running).
+    let rms = {
+        let sum_sq: f64 = dc_blocked.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        (sum_sq / dc_blocked.len().max(1) as f64)
+            .sqrt()
+            .max(1.0 / i16::MAX as f64)
+    };
+    let agc_inv = (1.0 / rms) as f32;
+
+    // 3. Boxcar matched filter (length sps), AGC-scaled.
+    let boxcar_len = sps.floor().max(1.0) as usize;
+    let mf: Vec<f32> = boxcar_matched_filter(&dc_blocked, boxcar_len)
+        .iter()
+        .map(|&x| x * agc_inv)
+        .collect();
+    let boxcar_delay_samples = (boxcar_len as f64 - 1.0) / 2.0;
+
+    let total_delay_samples = dc_delay_samples + boxcar_delay_samples;
+
+    // 4. Mueller-Müller timing recovery + linearly-interpolated strobe.
+    let (symbols, sample_positions) = mueller_muller_ted(&mf, sps);
+
+    let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
+    let bit_times_ms: Vec<f64> = sample_positions
+        .iter()
+        .map(|&p| (p - total_delay_samples) / fs * 1000.0)
+        .collect();
+
+    let recovered_rate = if sample_positions.len() > 1 {
+        let mean_sps = (sample_positions.last().unwrap() - sample_positions[0])
+            / (sample_positions.len() - 1) as f64;
+        fs / mean_sps
+    } else {
+        SYMBOL_RATE_HZ
+    };
+
+    BitStream {
+        bits,
+        bit_times_ms,
+        recovered_symbol_rate: recovered_rate,
+    }
+}
+
+/// Port of `modem.c`'s DC-block: `y[n] = x[n] - x[n-1] + alpha*y[n-1]`.
+fn one_pole_dc_block(input: &[f32], alpha: f32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut prev_x = 0.0f32;
+    let mut prev_y = 0.0f32;
+    for &x in input {
+        let y = x - prev_x + alpha * prev_y;
+        out.push(y);
+        prev_x = x;
+        prev_y = y;
+    }
+    out
+}
+
+/// Group delay (in samples) of [`one_pole_dc_block`]'s `H(z) = (1 - z^-1) /
+/// (1 - alpha*z^-1)`, evaluated (via the same numerical-derivative-of-
+/// phase approach as `dsp.rs`'s earlier Butterworth analysis used) at half
+/// the symbol rate — a representative frequency for where this filter's
+/// *passband* behavior matters, since (unlike a low-pass) the signal band
+/// here sits well above this high-pass's own cutoff (~40 Hz), not below
+/// it.
+fn one_pole_dc_block_group_delay_samples(fs: f64) -> f64 {
+    let alpha = MM_DC_BLOCK_ALPHA as f64;
+    let phase_at = |omega: f64| -> f64 {
+        let (s, c) = omega.sin_cos();
+        let num_phase = s.atan2(1.0 - c);
+        let den_phase = (alpha * s).atan2(1.0 - alpha * c);
+        num_phase - den_phase
+    };
+    let omega0 = 2.0 * std::f64::consts::PI * (SYMBOL_RATE_HZ / 2.0) / fs;
+    let h = 1e-4_f64;
+    -(phase_at(omega0 + h) - phase_at(omega0 - h)) / (2.0 * h)
+}
+
+/// Port of `modem.c`'s Mueller-Müller timing loop: a decision-directed TED
+/// (`error = sign(y[k-1])·y[k] - sign(y[k])·y[k-1]`) with a pure
+/// proportional loop filter (no integral term) and linear-interpolated
+/// strobe sampling.
+fn mueller_muller_ted(mf: &[f32], sps: f64) -> (Vec<f32>, Vec<f64>) {
+    let max_step = sps * MM_MAX_STEP_FRACTION;
+
+    let mut symbols: Vec<f32> = Vec::with_capacity((mf.len() as f64 / sps) as usize);
+    let mut sample_positions: Vec<f64> = Vec::new();
+
+    let mut pos = sps;
+    let mut prev_y = 0.0f64;
+    let mut prev_dec = 0.0f64;
+    let mut have_prev = false;
+
+    while pos + 1.0 < mf.len() as f64 {
+        let i = pos.floor() as usize;
+        let frac = pos - i as f64;
+        if i + 1 >= mf.len() {
+            break;
+        }
+        let y = mf[i] as f64 * (1.0 - frac) + mf[i + 1] as f64 * frac;
+        let dec = if y >= 0.0 { 1.0 } else { -1.0 };
+
+        symbols.push(y as f32);
+        sample_positions.push(pos);
+
+        let mut advance = sps;
+        if have_prev {
+            let ted = prev_dec * y - dec * prev_y;
+            let adj = (MM_LOOP_KP * ted).clamp(-max_step, max_step);
+            advance += adj;
+        }
+        pos += advance;
+        prev_y = y;
+        prev_dec = dec;
+        have_prev = true;
+    }
+
+    (symbols, sample_positions)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
