@@ -42,7 +42,7 @@ impl OutputFilter {
 }
 
 #[derive(Parser)]
-#[command(about = "AX100 ASM+Golay (CSP) beacon decoder — emits JSONL to stdout")]
+#[command(version, about = "AX100 ASM+Golay (CSP) beacon decoder — emits JSONL to stdout")]
 struct Cli {
     /// Audio files to decode (.wav or .ogg), already Doppler-corrected.
     #[arg(required = true)]
