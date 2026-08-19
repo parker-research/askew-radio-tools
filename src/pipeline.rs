@@ -109,8 +109,8 @@ fn decode_bitstream(
         // Round to microsecond precision (i.e. the nearest 0.001 ms).
         let time_in_file_ms = (time_in_file_ms * 1000.0).round() / 1000.0;
 
-        let frame_end_bit = (raw.sync_bit_offset + 32 + raw.data.len() * 8)
-            .min(bitstream.bit_rssi_db.len());
+        let frame_end_bit =
+            (raw.sync_bit_offset + 32 + raw.data.len() * 8).min(bitstream.bit_rssi_db.len());
         let rssi_db = mean_rssi_db(&bitstream.bit_rssi_db[raw.sync_bit_offset..frame_end_bit]);
 
         records.push(BeaconRecord {

@@ -260,7 +260,10 @@ fn local_rssi_db(signal: &[f32], pos: f64, sps: f64) -> f64 {
         // JSON output (`serde_json` can't serialize non-finite floats).
         return -240.0;
     }
-    let sum_sq: f64 = signal[lo..hi].iter().map(|&x| (x as f64) * (x as f64)).sum();
+    let sum_sq: f64 = signal[lo..hi]
+        .iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum();
     let rms = (sum_sq / (hi - lo) as f64).sqrt();
     20.0 * (rms + 1e-12).log10()
 }
