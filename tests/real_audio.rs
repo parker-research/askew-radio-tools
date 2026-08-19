@@ -10,7 +10,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use ax100_radio_csp_decoder::pipeline;
+use askew_radio_tools::pipeline;
 
 fn cache_dir() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))

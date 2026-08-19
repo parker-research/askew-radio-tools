@@ -1,8 +1,12 @@
 [package]
-name = "ax100-radio-csp-decoder"
+name = "askew-radio-tools"
 version = "0.1.0"
 edition = "2024"
 description = "AX100 satellite beacon decoder for SatNOGS audio"
+
+[[bin]]
+name = "askew_demod_from_file"
+path = "src/main.rs"
 
 [dependencies]
 # Read audio files.

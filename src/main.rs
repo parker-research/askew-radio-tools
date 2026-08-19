@@ -1,7 +1,7 @@
 //! Command-line entry point for the AX100 ASM+Golay (CSP) beacon decoder.
 //!
 //! Usage:
-//!   ax100-radio-csp-decoder <audio_file.wav|.ogg> [more files...]
+//!   askew_demod_from_file <audio_file.wav|.ogg> [more files...]
 //!
 //! Each already-doppler-corrected audio file is decoded independently.
 //! Decoded CSP frames are written to stdout as JSONL (one JSON object per
@@ -12,8 +12,8 @@
 //! than dropped, unless filtered out via `--output-filter`. All other
 //! diagnostics go to stderr so stdout stays valid JSONL.
 
-use ax100_radio_csp_decoder::pipeline::BeaconRecord;
-use ax100_radio_csp_decoder::{audio_check, pipeline};
+use askew_radio_tools::pipeline::BeaconRecord;
+use askew_radio_tools::{audio_check, pipeline};
 use clap::{Parser, ValueEnum};
 
 /// Which decoded frames to include in the JSONL output.
@@ -80,8 +80,8 @@ fn decode_and_print(
     path: &str,
     show_filename: bool,
     output_filter: OutputFilter,
-) -> Result<(), ax100_radio_csp_decoder::DecodeError> {
-    let audio = ax100_radio_csp_decoder::audio::load_audio(path)?;
+) -> Result<(), askew_radio_tools::DecodeError> {
+    let audio = askew_radio_tools::audio::load_audio(path)?;
     let metrics = audio_check::check(&audio);
     eprintln!("{path}: {}", metrics.verdict);
 
