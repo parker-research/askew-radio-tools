@@ -92,8 +92,26 @@ const SYMBOL_RATE_HZ: f64 = 9600.0;
 
 /// `_default_clk_rel_bw` — Gardner loop's normalized natural frequency
 /// (`omega_n_norm` in `clock_tracking_loop`), i.e. loop bandwidth relative
-/// to the symbol rate.
-const CLK_BW: f64 = 0.06;
+/// to the symbol rate. This is a single, fixed, continuous loop running
+/// over a whole multi-minute capture — even well-tuned (this ports
+/// gr-satellites' exact defaults, not a guess), it can still momentarily
+/// lose lock at some specific point in an 11-minute file and miss a real
+/// burst there. Benchmarking against gr_satellites' reference decoder on
+/// real captures confirmed this happens rarely but for real: one burst
+/// undecoded at the default bandwidth decoded cleanly at every one of
+/// several other bandwidths tried. So [`CLK_BW_CANDIDATES`] runs a small,
+/// cheap ensemble of bandwidths and merges whatever each recovers
+/// (deduplicated downstream by payload bytes), rather than relying on a
+/// single value.
+const CLK_BW: f64 = CLK_BW_CANDIDATES[0];
+
+/// Loop bandwidths to try (see [`CLK_BW`]'s comment). The first is
+/// gr-satellites' actual default (`_default_clk_rel_bw`); the rest are
+/// arbitrary but spread around it — any one of them recovering a frame
+/// the default misses is enough, so precisely which extra values are
+/// used matters much less than having a couple of options.
+pub const CLK_BW_CANDIDATES: &[f64] = &[0.06, 0.03, 0.12];
+
 /// `damping=1.0` in the `symbol_sync_ff` call — critically damped.
 const CLK_DAMPING: f64 = 1.0;
 /// "Empiric formula for TED gain of Gardner detector" per
@@ -117,11 +135,19 @@ const DC_BLOCKER_LENGTH_SYMBOLS: f64 = 32.0;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Run the full DSP front-end on a decoded audio buffer.
+/// Run the full DSP front-end on a decoded audio buffer using the default
+/// (gr-satellites-matching) loop bandwidth. See [`CLK_BW_CANDIDATES`] for
+/// running with an alternate bandwidth.
 ///
 /// `samples` must be mono f32 normalised to [-1.0, 1.0] at a sample rate
 /// high enough to represent 9600 baud (≥ 19200 Hz, typically 48000 Hz).
 pub fn fm_discriminate_and_filter(audio: &AudioSamples) -> BitStream {
+    fm_discriminate_and_filter_with_bw(audio, CLK_BW)
+}
+
+/// Same as [`fm_discriminate_and_filter`], but with an explicit Gardner
+/// loop bandwidth (see [`CLK_BW_CANDIDATES`]).
+pub fn fm_discriminate_and_filter_with_bw(audio: &AudioSamples, clk_bw: f64) -> BitStream {
     let fs = audio.sample_rate as f64;
     let sps = fs / SYMBOL_RATE_HZ;
 
@@ -148,7 +174,8 @@ pub fn fm_discriminate_and_filter(audio: &AudioSamples) -> BitStream {
     let total_delay_samples = boxcar_delay_samples + dc_delay_samples;
 
     // 4. Gardner timing error detector + PFB-interpolated sampling.
-    let (symbols, sample_positions, recovered_rate) = gardner_ted(&agced, fs, SYMBOL_RATE_HZ);
+    let (symbols, sample_positions, recovered_rate) =
+        gardner_ted(&agced, fs, SYMBOL_RATE_HZ, clk_bw);
 
     // 5. Hard decision (slicer): positive deviation → 1, negative → 0
     let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
@@ -369,10 +396,10 @@ fn pi_loop_gains(damping: f64, loop_bw: f64, ted_gain: f64) -> (f64, f64) {
     (alpha, beta)
 }
 
-fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64) -> (Vec<f32>, Vec<f64>, f64) {
+fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64, clk_bw: f64) -> (Vec<f32>, Vec<f64>, f64) {
     let sps = fs / symbol_rate;
     let max_deviation = CLK_LIMIT * sps;
-    let (alpha, beta) = pi_loop_gains(CLK_DAMPING, CLK_BW, CLK_TED_GAIN);
+    let (alpha, beta) = pi_loop_gains(CLK_DAMPING, clk_bw, CLK_TED_GAIN);
 
     let mut avg_period = sps;
     let mut inst_period = sps;
