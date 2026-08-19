@@ -8,9 +8,6 @@ description = "AX100 satellite beacon decoder for SatNOGS audio"
 # Read audio files.
 symphonia = { version = "0.5", features = ["wav", "ogg", "vorbis"] }
 
-# Digital second order IIR filters, also known as biquads.
-biquad = "0.4"
-
 # Calculate CRC32 (has platform-specific performance optimizations too).
 crc32c = "0.6"
 

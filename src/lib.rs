@@ -14,6 +14,7 @@ pub mod dsp;
 pub mod error;
 pub mod fec;
 pub mod framing;
+mod pfb_taps;
 pub mod pipeline;
 
 pub use error::DecodeError;

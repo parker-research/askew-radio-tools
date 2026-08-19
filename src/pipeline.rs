@@ -42,58 +42,44 @@ pub fn decode_file(path: &str) -> Result<Vec<BeaconRecord>, DecodeError> {
 /// callers that also want to run [`crate::audio_check`] don't have to
 /// decode the file twice).
 ///
-/// Runs the DSP front-end once per gain pair in
-/// [`dsp::GARDNER_GAIN_CANDIDATES`] (whole-file passes), plus the tiled
-/// local re-lock pass ([`dsp::local_relock_bitstreams`]), and merges all
-/// the decoded frames (deduplicated by payload bytes). A single
-/// continuous symbol-timing loop isn't reliable across a whole
-/// multi-minute capture — see the comment on `gardner_ted` and on
-/// `local_relock_bitstreams` in `dsp.rs` — so trying several whole-file
-/// gains *and* many short independently-relocked chunks, then taking the
-/// union, catches real frames that any one continuous pass's phase drift
-/// would miss.
+/// Runs the DSP front-end (a close port of gr-satellites'
+/// `fsk_demodulator` — see the module doc on `dsp.rs`) once over the whole
+/// file and decodes every frame whose Golay-coded header decodes.
 pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<BeaconRecord> {
     let mut seen_payloads: HashSet<Vec<u8>> = HashSet::new();
     let mut records = Vec::new();
 
-    let mut bitstreams: Vec<dsp::BitStream> = dsp::GARDNER_GAIN_CANDIDATES
-        .iter()
-        .map(|&(alpha, beta)| dsp::fm_discriminate_and_filter_with_gains(audio, alpha, beta))
-        .collect();
-    bitstreams.extend(dsp::local_relock_bitstreams(audio));
+    let bitstream = dsp::fm_discriminate_and_filter(audio);
+    let raw_frames = framing::find_frames(&bitstream.bits);
 
-    for bitstream in &bitstreams {
-        let raw_frames = framing::find_frames(&bitstream.bits);
+    for raw in &raw_frames {
+        let decoded = match fec::ax100_asm_golay_decode(&raw.data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
-        for raw in &raw_frames {
-            let decoded = match fec::ax100_asm_golay_decode(&raw.data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if !seen_payloads.insert(decoded.payload.clone()) {
-                continue; // already found via an earlier gain pair
-            }
-
-            let crc_pass = fec::csp_crc32c_check(&decoded.payload);
-            let time_in_file_ms = bitstream
-                .bit_times_ms
-                .get(raw.sync_bit_offset)
-                .copied()
-                .unwrap_or(0.0);
-            // Round to microsecond precision (i.e. the nearest 0.001 ms).
-            let time_in_file_ms = (time_in_file_ms * 1000.0).round() / 1000.0;
-
-            records.push(BeaconRecord {
-                filename: filename.to_string(),
-                data_length_bytes: decoded.payload.len(),
-                time_in_file_ms,
-                rs_corrected_error_count: decoded.rs_corrected_error_count,
-                rs_correctable: decoded.rs_correctable,
-                crc_pass,
-                data_hex: hex_encode(&decoded.payload),
-            });
+        if !seen_payloads.insert(decoded.payload.clone()) {
+            continue; // duplicate syncword hit on the same real frame
         }
+
+        let crc_pass = fec::csp_crc32c_check(&decoded.payload);
+        let time_in_file_ms = bitstream
+            .bit_times_ms
+            .get(raw.sync_bit_offset)
+            .copied()
+            .unwrap_or(0.0);
+        // Round to microsecond precision (i.e. the nearest 0.001 ms).
+        let time_in_file_ms = (time_in_file_ms * 1000.0).round() / 1000.0;
+
+        records.push(BeaconRecord {
+            filename: filename.to_string(),
+            data_length_bytes: decoded.payload.len(),
+            time_in_file_ms,
+            rs_corrected_error_count: decoded.rs_corrected_error_count,
+            rs_correctable: decoded.rs_correctable,
+            crc_pass,
+            data_hex: hex_encode(&decoded.payload),
+        });
     }
 
     records.sort_by(|a, b| a.time_in_file_ms.total_cmp(&b.time_in_file_ms));

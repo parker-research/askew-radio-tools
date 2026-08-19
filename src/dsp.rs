@@ -1,4 +1,5 @@
-//! DSP pipeline: low-pass filter → symbol timing → bit decisions.
+//! DSP pipeline: matched filter → DC block → AGC → symbol timing → bit
+//! decisions.
 //!
 //! ## Pipeline overview
 //!
@@ -7,14 +8,52 @@
 //!                     as produced by the SDR/ground-station chain)
 //!      │
 //!      ▼
-//! [Biquad Low-Pass]    ~14.4 kHz cutoff (1.5× symbol rate)
+//! [Boxcar matched filter]   length = round(fs / symbol_rate)
 //!      │
 //!      ▼
-//! [Gardner TED]        symbol timing recovery loop
+//! [DC blocker]               4th-order cascaded-moving-average highpass
 //!      │
 //!      ▼
-//! [Slicer]             threshold at 0 → Vec<bool> NRZ bits
+//! [RMS AGC]                  normalises to unit RMS
+//!      │
+//!      ▼
+//! [Gardner TED + PFB interp] symbol timing recovery loop
+//!      │
+//!      ▼
+//! [Slicer]                   threshold at 0 → Vec<bool> NRZ bits
 //! ```
+//!
+//! This is a close port of gr-satellites' `fsk_demodulator` (real/non-IQ
+//! input path, `components/demodulators/fsk_demodulator.py`), which
+//! FRONTIERSAT's flowgraph uses ahead of `ax100_deframer`:
+//!
+//! ```text
+//! sqfilter_len = int(samp_rate / baudrate)
+//! taps = np.ones(sqfilter_len) / sqfilter_len
+//! self.lowpass = filter.fir_filter_fff(decimation, taps)      # boxcar
+//! self.dcblock = filter.dc_blocker_ff(ceil(sps * 32), True)   # DC blocker
+//! self.agc = rms_agc_f(2e-2 / sps, 1)                         # RMS AGC
+//! self.clock_recovery = digital.symbol_sync_ff(
+//!     digital.TED_GARDNER, sps, clk_bw, damping, ted_gain,
+//!     clk_limit * sps, 1, constellation_bpsk().base(), digital.IR_PFB_NO_MF)
+//! ```
+//!
+//! (decimation is always 1 here — `sps = fs/baudrate` is ≤ 10 for every
+//! sample rate this decoder supports, which is gr-satellites' own
+//! threshold for decimating ahead of the matched filter, so that path
+//! isn't implemented.)
+//!
+//! An earlier version of this module used a generic Butterworth low-pass
+//! and a hand-tuned, much-lower-bandwidth Gardner loop with plain linear
+//! interpolation, plus several ad-hoc mitigations (trying multiple loop
+//! gains, re-locking on short anchored windows) for the loop losing lock
+//! over a multi-minute capture. Benchmarking against gr_satellites'
+//! reference decoder on real SatNOGS captures showed none of that closed
+//! the recall gap — this version replaces it with a direct port of
+//! gr-satellites' actual filter chain and loop parameters instead of
+//! guessing at replacements, including its 8-tap MMSE polyphase-filterbank
+//! interpolator (see `pfb_taps.rs`) and the exact PI loop gain formula its
+//! `clock_tracking_loop` uses.
 //!
 //! SatNOGS "audio" captures for AX100 are the *already demodulated*
 //! instantaneous-frequency waveform (this is what gr-satellites'
@@ -24,17 +63,11 @@
 //! stage here: `audio.samples` is used directly as the frequency-deviation
 //! signal, positive values meaning the "mark" tone and negative values the
 //! "space" tone.
-//!
-//! (An earlier version of this module additionally ran a Hilbert-transform
-//! based FM discriminator on top of this signal, which is both redundant
-//! with an already-demodulated input and numerically wrong at AX100's
-//! symbol rate: a 64-tap Hilbert FIR is not accurate enough at 3200 Hz
-//! relative to a 48 kHz sample rate, and was verified to produce the same
-//! sign for both +3200 Hz and -3200 Hz tones.)
 
-use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type};
+use std::collections::VecDeque;
 
 use crate::audio::AudioSamples;
+use crate::pfb_taps::PFB_INTERP_TAPS;
 
 /// Output of the DSP front-end: a stream of NRZ bits and the recovered
 /// symbol rate (should be ≈ 9600 Hz).
@@ -49,70 +82,79 @@ pub struct BitStream {
 }
 
 // ---------------------------------------------------------------------------
+// gr-satellites `fsk_demodulator` parameters (components/demodulators/
+// fsk_demodulator.py), specifically FRONTIERSAT's transmitter config: no
+// explicit clk_bw/clk_limit/deviation override, so these are the class
+// defaults.
+// ---------------------------------------------------------------------------
+
+const SYMBOL_RATE_HZ: f64 = 9600.0;
+
+/// `_default_clk_rel_bw` — Gardner loop's normalized natural frequency
+/// (`omega_n_norm` in `clock_tracking_loop`), i.e. loop bandwidth relative
+/// to the symbol rate.
+const CLK_BW: f64 = 0.06;
+/// `damping=1.0` in the `symbol_sync_ff` call — critically damped.
+const CLK_DAMPING: f64 = 1.0;
+/// "Empiric formula for TED gain of Gardner detector" per
+/// `fsk_demodulator.py`'s comment.
+const CLK_TED_GAIN: f64 = 1.47;
+/// `_default_clk_limit` — max allowed deviation of the average clock
+/// period from nominal, as a fraction of samples-per-symbol.
+const CLK_LIMIT: f64 = 0.004;
+
+/// `rms_agc_f`'s alpha numerator: `agc_constant = 2e-2 / sps` gives "a time
+/// constant of 50 symbols" per the comment in `fsk_demodulator.py`.
+const AGC_ALPHA_NUMERATOR: f64 = 2e-2;
+/// `rms_agc_f(agc_constant, 1)` — reference amplitude of 1.0 (not the
+/// `rms_agc_f` class default of 0.5).
+const AGC_REFERENCE: f32 = 1.0;
+
+/// `ceil(sps * 32)` multiplier for the DC blocker's moving-average length.
+const DC_BLOCKER_LENGTH_SYMBOLS: f64 = 32.0;
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// A handful of Gardner loop-filter (proportional, integral) gain pairs to
-/// try when [`fm_discriminate_and_filter`]'s default doesn't lock onto a
-/// given capture. See [`gardner_ted`]'s comment on why a single fixed gain
-/// isn't robust across a whole multi-minute file: over millions of mostly-
-/// noise symbols the loop's phase error random-walks, so which gain
-/// happens to keep it well-aligned during any one real burst is
-/// essentially arbitrary. Trying several bandwidths and merging whatever
-/// each one manages to decode (deduplicated downstream) catches frames
-/// that any single fixed gain would miss.
-pub const GARDNER_GAIN_CANDIDATES: &[(f64, f64)] = &[
-    (0.00003, 0.000003),
-    (0.0001, 0.00001),
-    (0.00001, 0.000001),
-    (0.0003, 0.00003),
-    (0.000003, 0.0000003),
-];
-
-/// Run the full DSP front-end on a decoded audio buffer using the default
-/// (best-known) Gardner loop gains. See [`GARDNER_GAIN_CANDIDATES`] for
-/// running with alternate gains.
+/// Run the full DSP front-end on a decoded audio buffer.
 ///
 /// `samples` must be mono f32 normalised to [-1.0, 1.0] at a sample rate
 /// high enough to represent 9600 baud (≥ 19200 Hz, typically 48000 Hz).
 pub fn fm_discriminate_and_filter(audio: &AudioSamples) -> BitStream {
-    let (alpha, beta) = GARDNER_GAIN_CANDIDATES[0];
-    fm_discriminate_and_filter_with_gains(audio, alpha, beta)
-}
-
-/// Same as [`fm_discriminate_and_filter`], but with explicit Gardner
-/// loop-filter gains (see [`GARDNER_GAIN_CANDIDATES`]).
-pub fn fm_discriminate_and_filter_with_gains(
-    audio: &AudioSamples,
-    alpha: f64,
-    beta: f64,
-) -> BitStream {
     let fs = audio.sample_rate as f64;
-    let symbol_rate = 9600.0_f64;
+    let sps = fs / SYMBOL_RATE_HZ;
 
-    // 1. Low-pass filter at 1.5 × symbol_rate to strip out-of-band noise
-    let lpf_cutoff = symbol_rate * 1.5; // 14 400 Hz
-    let filtered = lowpass_filter(&audio.samples, fs, lpf_cutoff);
+    // 1. Boxcar matched filter (matched to the rectangular NRZ pulse).
+    let boxcar_len = (fs / SYMBOL_RATE_HZ).floor().max(1.0) as usize;
+    let matched = boxcar_matched_filter(&audio.samples, boxcar_len);
+    let boxcar_delay_samples = (boxcar_len as f64 - 1.0) / 2.0;
 
-    // The LPF is causal, so its output at sample index i reflects input
-    // energy from *earlier* in the signal — a fixed number of samples
-    // earlier, equal to the filter's group delay. `gardner_ted` reports
-    // symbol positions as indices into `filtered`'s timeline, which are
-    // otherwise a precise, direct measurement of the original audio
-    // timeline (see the module doc and `GARDNER_GAIN_CANDIDATES` comment);
-    // this is the one systematic (non-random) offset in that chain, so we
-    // subtract it back out before converting to real time.
-    let lpf_group_delay_samples = biquad_lowpass_group_delay_samples(fs, lpf_cutoff);
+    // 2. DC blocker (cascaded-moving-average highpass).
+    let dc_length = (sps * DC_BLOCKER_LENGTH_SYMBOLS).ceil().max(1.0) as usize;
+    let dc_blocked = dc_blocker(&matched, dc_length);
+    let dc_delay_samples = (2 * dc_length).saturating_sub(2) as f64;
 
-    // 2. Gardner timing error detector + interpolated sampling
-    let (symbols, sample_positions, recovered_rate) =
-        gardner_ted(&filtered, fs, symbol_rate, alpha, beta);
+    // 3. RMS AGC.
+    let agc_alpha = (AGC_ALPHA_NUMERATOR / sps) as f32;
+    let agced = rms_agc(&dc_blocked, agc_alpha, AGC_REFERENCE);
 
-    // 3. Hard decision (slicer): positive deviation → 1, negative → 0
+    // The boxcar and DC-blocker stages are both causal, linear-phase FIR-
+    // style filters with a fixed, exactly-known sample delay; the PFB
+    // interpolator below introduces none (see `pfb_interpolate`'s comment).
+    // `gardner_ted`'s reported symbol positions are otherwise a precise,
+    // direct measurement of the original audio timeline, so subtract this
+    // one systematic offset back out before converting to real time.
+    let total_delay_samples = boxcar_delay_samples + dc_delay_samples;
+
+    // 4. Gardner timing error detector + PFB-interpolated sampling.
+    let (symbols, sample_positions, recovered_rate) = gardner_ted(&agced, fs, SYMBOL_RATE_HZ);
+
+    // 5. Hard decision (slicer): positive deviation → 1, negative → 0
     let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
     let bit_times_ms: Vec<f64> = sample_positions
         .iter()
-        .map(|&p| (p - lpf_group_delay_samples) / fs * 1000.0)
+        .map(|&p| (p - total_delay_samples) / fs * 1000.0)
         .collect();
 
     BitStream {
@@ -123,304 +165,244 @@ pub fn fm_discriminate_and_filter_with_gains(
 }
 
 // ---------------------------------------------------------------------------
-// Step 1: Biquad low-pass filter
+// Step 1: Boxcar matched filter (port of fsk_demodulator.py's `self.lowpass`)
 // ---------------------------------------------------------------------------
-//
-// Second-order Butterworth IIR in Direct Form II Transposed.
-// `biquad` crate handles the coefficient computation.
 
-fn lowpass_filter(input: &[f32], fs: f64, cutoff_hz: f64) -> Vec<f32> {
-    let coeffs = Coefficients::<f32>::from_params(
-        Type::LowPass,
-        (fs as f32).hz(),
-        (cutoff_hz as f32).hz(),
-        biquad::Q_BUTTERWORTH_F32,
-    )
-    .expect("LPF coefficient computation failed — check sample rate and cutoff values");
-
-    let mut filter = DirectForm2Transposed::<f32>::new(coeffs);
-    input.iter().map(|&s| filter.run(s)).collect()
-}
-
-/// Group delay (in samples) of the same Butterworth low-pass this module
-/// filters with, evaluated at DC.
-///
-/// An IIR filter's group delay isn't perfectly constant across frequency
-/// the way a linear-phase FIR's is, but a maximally-flat (Butterworth)
-/// low-pass stays close to flat through most of its passband, so a single
-/// representative value — the conventional choice being DC — is a good
-/// approximation of "the" delay for a signal whose energy sits below
-/// cutoff (as ours does: cutoff is 1.5× the symbol rate).
-///
-/// Computed analytically from the exact same Audio-EQ-Cookbook biquad
-/// coefficients `lowpass_filter` uses (via `biquad`'s own formulas, just
-/// evaluated in `f64` here for a cleaner analysis independent of the
-/// runtime filter's `f32` rounding — the difference between the two is far
-/// below anything else's precision floor in this pipeline): group delay is
-/// `-dφ/dω` of the filter's phase response, taken via a central-difference
-/// numerical derivative.
-fn biquad_lowpass_group_delay_samples(fs: f64, cutoff_hz: f64) -> f64 {
-    let coeffs = Coefficients::<f64>::from_params(
-        Type::LowPass,
-        fs.hz(),
-        cutoff_hz.hz(),
-        biquad::Q_BUTTERWORTH_F64,
-    )
-    .expect("LPF coefficient computation failed — check sample rate and cutoff values");
-
-    // Phase response of H(z) = (b0 + b1 z^-1 + b2 z^-2) / (1 + a1 z^-1 + a2 z^-2)
-    // at z = e^{jω}, ω in radians/sample.
-    let phase_at = |omega: f64| -> f64 {
-        let (s1, c1) = omega.sin_cos();
-        let (s2, c2) = (2.0 * omega).sin_cos();
-        let num_re = coeffs.b0 + coeffs.b1 * c1 + coeffs.b2 * c2;
-        let num_im = -(coeffs.b1 * s1 + coeffs.b2 * s2);
-        let den_re = 1.0 + coeffs.a1 * c1 + coeffs.a2 * c2;
-        let den_im = -(coeffs.a1 * s1 + coeffs.a2 * s2);
-        num_im.atan2(num_re) - den_im.atan2(den_re)
-    };
-
-    // Group delay = -dφ/dω, evaluated at DC via central difference.
-    let h = 1e-4_f64;
-    -(phase_at(h) - phase_at(-h)) / (2.0 * h)
-}
-
-// ---------------------------------------------------------------------------
-// Anchored local re-lock: bound noise-driven phase random-walk
-// ---------------------------------------------------------------------------
-//
-// `fm_discriminate_and_filter_with_gains` runs the Gardner loop as one
-// continuous pass across the *entire* capture (typically several minutes,
-// millions of symbols, almost all of it noise between brief real bursts).
-// Even a low-bandwidth loop's phase estimate random-walks over that many
-// symbols, so whether it happens to be well-locked during any *particular*
-// burst is essentially arbitrary — [`GARDNER_GAIN_CANDIDATES`] papers over
-// this by trying a few fixed bandwidths, but a burst that all of them
-// happen to mis-track at that point in the file is still a straight miss
-// (confirmed empirically: comparing against gr_satellites' reference
-// decoder on real SatNOGS captures, we were missing real frames it
-// recovers — mostly repeat transmissions of messages we *did* catch at
-// other points in the same file, i.e. exactly the "arbitrary lock quality"
-// signature).
-//
-// A blind fixed-size chunk grid (an earlier version of this pass) doesn't
-// fix this: a chunk boundary falling shortly before a real burst still
-// leaves the loop under-converged (or, with noise ahead of the burst
-// inside the chunk, freshly wandered) right when it matters, and testing
-// against real captures confirmed it recovered zero additional frames.
-//
-// This version anchors each local re-lock window on an *actual* syncword
-// hit instead of a blind grid position: run the existing whole-file gain
-// candidates as usual and collect every position where `find_frames`
-// matched the syncword (within its normal 4-bit-error threshold) — even
-// hits whose *payload* decode later fails, since a sub-4-bit-error match
-// over 32 bits already pins that audio-sample position closely regardless
-// of how much the rest of the frame has drifted by that point in a
-// multi-minute pass. For each such anchor, re-run a *fresh* Gardner loop
-// (zeroed strobe position and integrator) over a short window starting
-// several hundred symbols before it — enough to converge — and ending one
-// frame past it. Because the window is anchored right where the real
-// signal actually is, convergence only has to hold locally for a couple
-// thousand symbols, not for the whole file.
-const RELOCK_PREROLL_SYMBOLS: f64 = 400.0;
-const RELOCK_POSTROLL_SYMBOLS: f64 = 50.0;
-
-/// Loop-filter gains for the anchored re-lock windows. Deliberately
-/// *faster* than [`GARDNER_GAIN_CANDIDATES`]'s low-bandwidth gains: those
-/// are tuned to resist multi-minute noise-driven walk, which isn't a
-/// concern here (windows are a couple thousand symbols), so a quicker
-/// pull-in during the short preroll matters more.
-const RELOCK_GAIN: (f64, f64) = (0.01, 0.001);
-
-/// Run the anchored local re-lock pass described above and return one
-/// [`BitStream`] per candidate window. Each is independently
-/// searched/decoded by the caller exactly like a
-/// [`GARDNER_GAIN_CANDIDATES`] pass — real frames recovered redundantly
-/// from more than one anchor (or already found by the whole-file passes)
-/// are deduplicated downstream by payload bytes.
-pub fn local_relock_bitstreams(audio: &AudioSamples) -> Vec<BitStream> {
-    let fs = audio.sample_rate as f64;
-    let symbol_rate = 9600.0_f64;
-    let sps = fs / symbol_rate;
-    let lpf_cutoff = symbol_rate * 1.5;
-
-    let filtered = lowpass_filter(&audio.samples, fs, lpf_cutoff);
-    let lpf_group_delay_samples = biquad_lowpass_group_delay_samples(fs, lpf_cutoff);
-
-    // 1. Coarse candidate detection: collect every syncword-hit sample
-    // position from the whole-file gain candidates, decoded or not.
-    let mut anchors: Vec<f64> = Vec::new();
-    for &(alpha, beta) in GARDNER_GAIN_CANDIDATES {
-        let (symbols, sample_positions, _recovered_rate) =
-            gardner_ted(&filtered, fs, symbol_rate, alpha, beta);
-        let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
-        for raw in crate::framing::find_frames(&bits) {
-            if let Some(&pos) = sample_positions.get(raw.sync_bit_offset) {
-                anchors.push(pos);
-            }
+/// Causal moving-average FIR of length `taps_len`, matching GNU Radio's
+/// `fir_filter_fff` with `taps = ones(taps_len)/taps_len` — implicit zero
+/// history before the start of `input`, same length output.
+fn boxcar_matched_filter(input: &[f32], taps_len: usize) -> Vec<f32> {
+    if taps_len == 0 {
+        return input.to_vec();
+    }
+    let mut out = Vec::with_capacity(input.len());
+    let mut sum = 0.0f32;
+    let mut window: VecDeque<f32> = VecDeque::with_capacity(taps_len);
+    for &x in input {
+        window.push_back(x);
+        sum += x;
+        if window.len() > taps_len {
+            sum -= window.pop_front().unwrap();
         }
+        out.push(sum / taps_len as f32);
     }
-
-    if anchors.is_empty() {
-        return Vec::new();
-    }
-    anchors.sort_by(f64::total_cmp);
-
-    // Merge anchors within a few symbols of each other — almost certainly
-    // the same real burst, hit by more than one gain candidate. This gap
-    // is deliberately much shorter than any realistic inter-frame spacing
-    // (frames in real captures are at least tens of ms apart) so distinct
-    // back-to-back frames aren't collapsed into one anchor.
-    let merge_gap_samples = 50.0 * sps;
-    let mut merged: Vec<f64> = Vec::new();
-    for pos in anchors {
-        if let Some(&last) = merged.last()
-            && pos - last < merge_gap_samples
-        {
-            continue;
-        }
-        merged.push(pos);
-    }
-
-    // 2. For each anchor, re-run a fresh Gardner loop over a short window
-    // starting well before it and ending one frame past it.
-    let frame_symbols = 32.0 + (crate::fec::ASM_FRAME_LEN_BYTES * 8) as f64;
-    let window_before = RELOCK_PREROLL_SYMBOLS * sps;
-    let window_after = (frame_symbols + RELOCK_POSTROLL_SYMBOLS) * sps;
-
-    let mut out = Vec::new();
-    for anchor in merged {
-        let window_start = (anchor - window_before).max(0.0) as usize;
-        let window_end = ((anchor + window_after) as usize).min(filtered.len());
-        if window_end <= window_start {
-            continue;
-        }
-        let chunk = &filtered[window_start..window_end];
-
-        let (symbols, sample_positions, _recovered_rate) =
-            gardner_ted(chunk, fs, symbol_rate, RELOCK_GAIN.0, RELOCK_GAIN.1);
-
-        let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
-        let bit_times_ms: Vec<f64> = sample_positions
-            .iter()
-            .map(|&p| (p + window_start as f64 - lpf_group_delay_samples) / fs * 1000.0)
-            .collect();
-
-        out.push(BitStream {
-            bits,
-            bit_times_ms,
-            recovered_symbol_rate: symbol_rate,
-        });
-    }
-
     out
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: Gardner timing error detector
+// Step 2: DC blocker (literal port of gr-filter's dc_blocker_ff, long_form)
+// ---------------------------------------------------------------------------
+
+/// Port of `gr::filter::moving_averager_f`: an efficient recursive
+/// D-sample moving average that also exposes the raw input delayed by
+/// `D - 1` samples (`delayed_sig`).
+struct MovingAverager {
+    length: usize,
+    out: f32,
+    out_d1: f32,
+    out_d2: f32,
+    delay_line: VecDeque<f32>,
+}
+
+impl MovingAverager {
+    fn new(length: usize) -> Self {
+        MovingAverager {
+            length,
+            out: 0.0,
+            out_d1: 0.0,
+            out_d2: 0.0,
+            delay_line: VecDeque::from(vec![0.0f32; length.saturating_sub(1)]),
+        }
+    }
+
+    fn filter(&mut self, x: f32) -> f32 {
+        self.out_d1 = self.out;
+        self.delay_line.push_back(x);
+        self.out = self.delay_line.pop_front().unwrap_or(0.0);
+
+        let y = x - self.out_d1 + self.out_d2;
+        self.out_d2 = y;
+
+        y / self.length as f32
+    }
+
+    fn delayed_sig(&self) -> f32 {
+        self.out
+    }
+}
+
+/// Port of `dc_blocker_ff_impl::work` with `long_form=true`: a cascade of
+/// four `MovingAverager`s (an efficient 4th-order cascaded-boxcar
+/// approximation of an ideal DC notch) subtracted from a matching-delay
+/// copy of the raw input.
+fn dc_blocker(input: &[f32], length: usize) -> Vec<f32> {
+    if length <= 1 {
+        return input.to_vec();
+    }
+    let mut ma0 = MovingAverager::new(length);
+    let mut ma1 = MovingAverager::new(length);
+    let mut ma2 = MovingAverager::new(length);
+    let mut ma3 = MovingAverager::new(length);
+    let mut delay_line: VecDeque<f32> = VecDeque::from(vec![0.0f32; length.saturating_sub(1)]);
+
+    let mut out = Vec::with_capacity(input.len());
+    for &x in input {
+        let y1 = ma0.filter(x);
+        let y2 = ma1.filter(y1);
+        let y3 = ma2.filter(y2);
+        let y4 = ma3.filter(y3);
+
+        delay_line.push_back(ma0.delayed_sig());
+        let d = delay_line.pop_front().unwrap_or(0.0);
+
+        out.push(d - y4);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: RMS AGC (port of gr-satellites' hier/rms_agc_f.py)
+// ---------------------------------------------------------------------------
+
+/// Port of `rms_agc_f`: `blocks.rms_ff(alpha)` (single-pole running RMS)
+/// feeding `output = input / (rms / reference + 1e-19)`.
+fn rms_agc(input: &[f32], alpha: f32, reference: f32) -> Vec<f32> {
+    let beta = 1.0 - alpha;
+    let mut avg = 0.0f32;
+    input
+        .iter()
+        .map(|&x| {
+            avg = beta * avg + alpha * x * x;
+            let rms = avg.sqrt();
+            x / (rms / reference + 1e-19)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: 8-tap MMSE polyphase-filterbank interpolator (port of GNU Radio's
+// `interp_resampler_pfb_no_mf_ff`, `digital.IR_PFB_NO_MF`)
+// ---------------------------------------------------------------------------
+
+/// Number of polyphase arms (`n_filters`, `symbol_sync_ff`'s default of
+/// 128, already a power of 2 so it's used as-is — see
+/// `interp_resampler_pfb_no_mf_ff`'s constructor, which rounds up to the
+/// next power of 2 and caps at `NSTEPS`, both no-ops at 128).
+const PFB_N_FILTERS: usize = 128;
+
+/// Interpolate `input`'s value at fractional position `pos` using the
+/// 8-tap MMSE polyphase filter bank (see `pfb_taps.rs`). Positions outside
+/// `input`'s bounds read as zero (matching a zero-padded/zero-history
+/// signal, same convention as [`boxcar_matched_filter`]).
+///
+/// This introduces no net delay: tap column 4 (of 0..7, offsets -4..+3)
+/// is `input[floor(pos)]` at `mu = 0` (row 0 of the table is a unit
+/// impulse there), so the interpolated value at `pos` is referenced
+/// directly against the same timeline `pos` is expressed in.
+fn pfb_interpolate(input: &[f32], pos: f64) -> f32 {
+    let base = pos.floor();
+    let mu = (pos - base) as f32;
+    let base = base as i64;
+
+    let arm = (mu * PFB_N_FILTERS as f32).round() as usize;
+    let taps = &PFB_INTERP_TAPS[arm.min(PFB_INTERP_TAPS.len() - 1)];
+
+    let mut acc = 0.0f32;
+    for (k, &tap) in taps.iter().enumerate() {
+        let idx = base + k as i64 - 4;
+        if idx >= 0 && (idx as usize) < input.len() {
+            acc += tap * input[idx as usize];
+        }
+    }
+    acc
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: Gardner timing error detector (port of GNU Radio's
+// `ted_gardner` + `clock_tracking_loop`, driven as `symbol_sync_ff` does
+// with `TED_GARDNER` — inputs_per_symbol=2, i.e. one mid-symbol and one
+// on-symbol interpolated sample per symbol period)
 // ---------------------------------------------------------------------------
 //
 // The Gardner TED is a decision-directed timing error detector that works
 // on passband signals without a separate carrier reference. It estimates
-// the timing error τ from mid-symbol and on-symbol samples:
+// the timing error from mid-symbol and on-symbol samples:
 //
-//   e[k] = (y[k - T/2] - y[k + T/2]) · y[k]
+//   e[k] = (y[k - T] - y[k]) · y[k - T/2]
 //
-// where T is the symbol period in samples, y[k] is the on-symbol sample,
-// and y[k ± T/2] are the mid-symbol (strobe) samples.
+// where y[k] is the current on-symbol sample, y[k - T] the previous
+// on-symbol sample, and y[k - T/2] the mid-symbol sample between them —
+// this is `ted_gardner::compute_error_ff`'s `(d_input[2] - d_input[0]) *
+// d_input[1]` with `d_input[2]` the older on-symbol sample.
 //
-// The loop filter is a simple PI controller:
-//   μ[k+1] = μ[k] + α·e[k] + β·∑e[k]
+// The loop filter is `clock_tracking_loop`'s PI controller, with alpha
+// (proportional) and beta (integral) gains derived from the loop
+// bandwidth, damping factor and TED gain by `update_gains`'s exact
+// formula (ported in `pi_loop_gains` below) rather than hand-tuned.
 
-fn gardner_ted(
-    input: &[f32],
-    fs: f64,
-    symbol_rate: f64,
-    alpha: f64,
-    beta: f64,
-) -> (Vec<f32>, Vec<f64>, f64) {
-    let sps = fs / symbol_rate; // samples per symbol (e.g. 5.0 for 48000/9600)
+/// Port of `clock_tracking_loop::update_gains` — maps (loop bandwidth,
+/// damping factor, TED gain) to the PI filter's (alpha, beta) gains via
+/// the standard 2nd-order digital control loop design equations.
+fn pi_loop_gains(damping: f64, loop_bw: f64, ted_gain: f64) -> (f64, f64) {
+    let zeta = damping;
+    let omega_n_t = loop_bw;
+    let zeta_omega_n_t = zeta * omega_n_t;
 
-    // The loop filter gains below are tuned assuming a roughly unit-
-    // amplitude signal. `input` here is a frequency-deviation waveform
-    // that can be at any scale (e.g. ±3200 for a 3200 Hz deviation), which
-    // would otherwise blow the TED error — and thus the correction — up by
-    // orders of magnitude and make the loop diverge instead of track. So
-    // normalise by RMS first; this doesn't affect the final sign-based
-    // slicer decision.
-    let rms = (input.iter().map(|&x| x * x).sum::<f32>() / input.len().max(1) as f32).sqrt();
-    let norm = if rms > 1e-12 { rms } else { 1.0 };
-    let input: Vec<f32> = input.iter().map(|&x| x / norm).collect();
-    let input = input.as_slice();
+    let k0 = 2.0 / ted_gain;
+    let k1 = (-zeta_omega_n_t).exp();
+    let sinh_zeta_omega_n_t = zeta_omega_n_t.sinh();
 
-    // `alpha`/`beta` are deliberately much lower-bandwidth than a
-    // "textbook" Gardner loop (which would use something like
-    // alpha=0.01, beta=0.001): over a multi-minute capture (millions of
-    // symbols, almost all of it noise between brief real transmissions),
-    // a higher-bandwidth loop tracks the noise itself, and the resulting
-    // phase error random-walks far enough that by the time a real burst
-    // arrives its alignment is essentially arbitrary. A slow loop stays
-    // much closer to the true (very stable, crystal-derived) symbol clock
-    // throughout, at the cost of taking longer to pull in a large initial
-    // offset — an acceptable trade-off here since Doppler/clock offset is
-    // small and roughly constant relative to a strong noise floor. See
-    // [`GARDNER_GAIN_CANDIDATES`] for why callers may want to try more
-    // than one gain pair.
+    let cosx_omega_d_t = match zeta.partial_cmp(&1.0).unwrap() {
+        std::cmp::Ordering::Greater => {
+            let omega_d_t = omega_n_t * (zeta * zeta - 1.0).sqrt();
+            omega_d_t.cosh()
+        }
+        std::cmp::Ordering::Equal => 1.0,
+        std::cmp::Ordering::Less => {
+            let omega_d_t = omega_n_t * (1.0 - zeta * zeta).sqrt();
+            omega_d_t.cos()
+        }
+    };
+
+    let alpha = k0 * k1 * sinh_zeta_omega_n_t;
+    let beta = k0 * (1.0 - k1 * (sinh_zeta_omega_n_t + cosx_omega_d_t));
+    (alpha, beta)
+}
+
+fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64) -> (Vec<f32>, Vec<f64>, f64) {
+    let sps = fs / symbol_rate;
+    let max_deviation = CLK_LIMIT * sps;
+    let (alpha, beta) = pi_loop_gains(CLK_DAMPING, CLK_BW, CLK_TED_GAIN);
+
+    let mut avg_period = sps;
+    let mut inst_period = sps;
+    let mut idx = sps; // current on-symbol strobe position
 
     let mut symbols: Vec<f32> = Vec::with_capacity(input.len() / sps as usize);
-    let mut int_err = 0.0_f64; // integrator state
-
-    // Track the actual sampling positions to estimate recovered symbol rate
     let mut sample_positions: Vec<f64> = Vec::new();
 
-    // We need the previous and previous-mid samples for the TED error.
-    // Step through the input one symbol at a time.
-    let mut idx = sps; // current (nominal) symbol strobe position
-
     while idx + sps < input.len() as f64 {
-        // Integer and fractional parts of the strobe position
-        let i_int = idx.floor() as usize;
-        let i_frac = idx - idx.floor();
+        let y_on = pfb_interpolate(input, idx);
+        let y_mid_prev = pfb_interpolate(input, idx - inst_period / 2.0);
+        let y_prev = pfb_interpolate(input, idx - inst_period);
 
-        // Linear interpolation helper
-        let interp = |pos: f64| -> f32 {
-            let i = pos.floor() as usize;
-            let frac = (pos - pos.floor()) as f32;
-            if i + 1 < input.len() {
-                input[i] + frac * (input[i + 1] - input[i])
-            } else {
-                input[i.min(input.len() - 1)]
-            }
-        };
-
-        // On-symbol sample y[k]
-        let y_on = interp(idx);
-
-        // Mid-symbol samples y[k - T/2] and y[k - 3T/2] (previous strobe)
-        let y_mid_prev = interp(idx - sps / 2.0);
-        let y_prev = interp(idx - sps);
-
-        // Gardner TED error: uses *previous* symbol to avoid decision feedback
+        // Gardner TED error: uses the *previous* on-symbol sample to avoid
+        // decision feedback.
         let error = ((y_prev - y_on) * y_mid_prev) as f64;
 
-        // PI loop filter. Clamp the integrator and the resulting correction
-        // so a run of same-signed errors (e.g. a long string of identical
-        // bits, or a sharp-edged square-wave deviation signal) can't wind
-        // the loop up to the point where the strobe stalls or goes
-        // backwards — which would hang the `while` loop below.
-        int_err = (int_err + beta * error).clamp(-sps / 4.0, sps / 4.0);
-        let correction = (alpha * error + int_err).clamp(-sps / 2.0, sps / 2.0);
+        // PI loop filter (`clock_tracking_loop::advance_loop`).
+        avg_period = (avg_period + beta * error).clamp(sps - max_deviation, sps + max_deviation);
+        inst_period = avg_period + alpha * error;
+        if inst_period <= 0.0 {
+            inst_period = avg_period;
+        }
 
         symbols.push(y_on);
         sample_positions.push(idx);
 
-        // Advance strobe by one symbol period, adjusted by loop
-        idx += sps - correction;
-        let _ = i_int; // suppress unused warning
-        let _ = i_frac;
+        idx += inst_period;
     }
 
-    // Estimate recovered symbol rate from mean inter-symbol spacing
     let recovered_rate = if sample_positions.len() > 1 {
         let mean_sps = (sample_positions.last().unwrap() - sample_positions[0])
             / (sample_positions.len() - 1) as f64;
@@ -488,37 +470,53 @@ mod tests {
     }
 
     #[test]
-    fn test_lpf_group_delay_is_small_and_positive() {
-        // Sanity bounds: a causal 2nd-order filter's delay should be
-        // positive (output lags input) and, for a cutoff well above the
-        // signal band, small relative to one symbol period (5 samples at
-        // 48 kHz / 9600 baud).
-        let d = biquad_lowpass_group_delay_samples(48_000.0, 14_400.0);
-        eprintln!("LPF group delay = {d} samples");
-        assert!(d > 0.0, "group delay should be positive, got {d}");
+    fn test_pi_loop_gains_match_fsk_demodulator_defaults() {
+        // Cross-check against an independent Python re-implementation of
+        // clock_tracking_loop::update_gains for gr-satellites'
+        // fsk_demodulator.py defaults (damping=1.0, clk_bw=0.06,
+        // ted_gain=1.47): alpha ≈ 0.07692487, beta ≈ 0.00230705.
+        let (alpha, beta) = pi_loop_gains(1.0, 0.06, 1.47);
         assert!(
-            d < 5.0,
-            "group delay should be well under 1 symbol, got {d}"
+            (alpha - 0.07692487).abs() < 1e-6,
+            "alpha = {alpha}, expected ~0.07692487"
+        );
+        assert!(
+            (beta - 0.00230705).abs() < 1e-6,
+            "beta = {beta}, expected ~0.00230705"
         );
     }
 
     #[test]
-    fn test_lpf_attenuates_high_freq() {
-        // Inject a signal above the LPF cutoff (20 kHz) — should be attenuated
-        let fs = 48_000.0f64;
-        let t: Vec<f32> = (0..4800)
-            .map(|i| (2.0 * std::f32::consts::PI * 20_000.0 * i as f32 / fs as f32).sin())
-            .collect();
-        let filtered = lowpass_filter(&t, fs, 14_400.0);
-        let rms_in: f32 = (t.iter().map(|s| s * s).sum::<f32>() / t.len() as f32).sqrt();
-        let rms_out: f32 =
-            (filtered.iter().map(|s| s * s).sum::<f32>() / filtered.len() as f32).sqrt();
-        // Should be significantly attenuated (>6 dB = factor 2)
+    fn test_pfb_interpolate_is_identity_at_integer_positions() {
+        let input = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        for i in 4..8 {
+            let got = pfb_interpolate(&input, i as f64);
+            assert!(
+                (got - input[i]).abs() < 1e-4,
+                "pfb_interpolate at integer position {i} should be ~identity, got {got}, expected {}",
+                input[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_boxcar_matched_filter_averages() {
+        let input = [1.0f32, 1.0, 1.0, 1.0, 1.0];
+        let out = boxcar_matched_filter(&input, 5);
+        // Zero-padded history means only the last sample sees the full window.
+        assert!((out[4] - 1.0).abs() < 1e-6);
+        assert!((out[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_rms_agc_normalises_amplitude() {
+        let input = vec![2.0f32; 2000];
+        let out = rms_agc(&input, 0.01, 1.0);
+        // After convergence, output amplitude should approach the reference (1.0).
+        let tail_avg: f32 = out[1000..].iter().sum::<f32>() / 1000.0;
         assert!(
-            rms_out < rms_in / 2.0,
-            "20 kHz signal should be attenuated through 14.4 kHz LPF: in={:.4}, out={:.4}",
-            rms_in,
-            rms_out
+            (tail_avg - 1.0).abs() < 0.05,
+            "AGC should converge output amplitude to ~1.0, got {tail_avg}"
         );
     }
 
@@ -528,7 +526,12 @@ mod tests {
         // so a phase/count bug can't accidentally look correct) at 9600
         // baud / 48 kHz and check the pipeline recovers both the right
         // number of symbols *and* the right values.
-        let pattern: Vec<bool> = (0..200u32)
+        //
+        // Long enough that the DC blocker's settling transient (4
+        // cascaded ~160-sample moving averages, per `DC_BLOCKER_LENGTH_
+        // SYMBOLS`) is a small fraction of the signal — real captures are
+        // minutes long, so this only matters for a short synthetic test.
+        let pattern: Vec<bool> = (0..1500u32)
             .map(|i| i.wrapping_mul(2654435761).rotate_left(13) % 5 < 2)
             .collect();
         let audio = make_deviation_audio(48_000, 9600.0, &pattern, 3200.0);
@@ -546,19 +549,37 @@ mod tests {
             ratio
         );
 
-        // Align the recovered bits against the known pattern (skip the
-        // first few symbols, which absorb the timing loop's startup
-        // transient) and check most of them match.
-        let skip = 10;
-        let compare_len = (result.bits.len() - skip).min(pattern.len() - skip);
-        let matches = (0..compare_len)
-            .filter(|&i| result.bits[skip + i] == pattern[skip + i])
-            .count();
-        let match_ratio = matches as f64 / compare_len as f64;
+        // Find the best constant index offset aligning the recovered
+        // bits against the pattern. The synthetic signal here has no
+        // noise pre-roll before the pattern starts (unlike a real
+        // capture, which has minutes of it), so the loop's first strobes
+        // land in the matched-filter/DC-blocker's own settling region —
+        // a fixed number of "virtual" symbols before the pattern's first
+        // real bit — hence a constant offset rather than a 1:1 index
+        // correspondence.
+        let mut best_ratio = 0.0f64;
+        for shift in -300i64..300 {
+            let mut matches = 0;
+            let mut compared = 0;
+            for (i, &bit) in result.bits.iter().enumerate() {
+                let j = i as i64 + shift;
+                if j < 0 || j as usize >= pattern.len() {
+                    continue;
+                }
+                compared += 1;
+                if bit == pattern[j as usize] {
+                    matches += 1;
+                }
+            }
+            if compared > pattern.len() / 2 {
+                best_ratio = best_ratio.max(matches as f64 / compared as f64);
+            }
+        }
         assert!(
-            match_ratio > 0.95,
-            "Recovered bits should mostly match the transmitted pattern, got {:.1}% match",
-            match_ratio * 100.0
+            best_ratio > 0.95,
+            "Recovered bits should mostly match the transmitted pattern at some \
+             constant offset, best match was only {:.1}%",
+            best_ratio * 100.0
         );
     }
 }
