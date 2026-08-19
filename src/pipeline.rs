@@ -62,8 +62,7 @@ pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<BeaconRecord> {
     let mut seen_payloads: HashSet<Vec<u8>> = HashSet::new();
     let mut records = Vec::new();
 
-    for &clk_bw in dsp::CLK_BW_CANDIDATES {
-        let bitstream = dsp::fm_discriminate_and_filter_with_bw(audio, clk_bw);
+    for bitstream in dsp::fm_discriminate_and_filter_multi_bw(audio, dsp::CLK_BW_CANDIDATES) {
         decode_bitstream(&bitstream, filename, &mut seen_payloads, &mut records);
     }
 

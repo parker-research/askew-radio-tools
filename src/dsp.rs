@@ -148,40 +148,76 @@ pub fn fm_discriminate_and_filter(audio: &AudioSamples) -> BitStream {
 /// Same as [`fm_discriminate_and_filter`], but with an explicit Gardner
 /// loop bandwidth (see [`CLK_BW_CANDIDATES`]).
 pub fn fm_discriminate_and_filter_with_bw(audio: &AudioSamples, clk_bw: f64) -> BitStream {
-    let fs = audio.sample_rate as f64;
-    let sps = fs / SYMBOL_RATE_HZ;
+    bitstream_from_front_end(&FrontEnd::compute(audio), clk_bw)
+}
 
-    // 1. Boxcar matched filter (matched to the rectangular NRZ pulse).
-    let boxcar_len = (fs / SYMBOL_RATE_HZ).floor().max(1.0) as usize;
-    let matched = boxcar_matched_filter(&audio.samples, boxcar_len);
-    let boxcar_delay_samples = (boxcar_len as f64 - 1.0) / 2.0;
+/// Run [`fm_discriminate_and_filter_with_bw`] for every bandwidth in `bws`,
+/// sharing one front-end computation (steps 1-3 below) across all of them
+/// instead of repeating it per bandwidth — those steps don't depend on
+/// `clk_bw` at all, only step 4 does. This is the same output as calling
+/// `fm_discriminate_and_filter_with_bw` once per entry in `bws`, just
+/// without redoing the shared ~2/3 of the work each time.
+pub fn fm_discriminate_and_filter_multi_bw(audio: &AudioSamples, bws: &[f64]) -> Vec<BitStream> {
+    let front_end = FrontEnd::compute(audio);
+    bws.iter()
+        .map(|&clk_bw| bitstream_from_front_end(&front_end, clk_bw))
+        .collect()
+}
 
-    // 2. DC blocker (cascaded-moving-average highpass).
-    let dc_length = (sps * DC_BLOCKER_LENGTH_SYMBOLS).ceil().max(1.0) as usize;
-    let dc_blocked = dc_blocker(&matched, dc_length);
-    let dc_delay_samples = (2 * dc_length).saturating_sub(2) as f64;
+/// Output of steps 1-3 (boxcar matched filter, DC blocker, RMS AGC) — the
+/// part of the pipeline that's the same regardless of the Gardner loop
+/// bandwidth used in step 4.
+struct FrontEnd {
+    agced: Vec<f32>,
+    fs: f64,
+    /// See the comment in [`bitstream_from_front_end`] on why this is
+    /// tracked and subtracted back out.
+    total_delay_samples: f64,
+}
 
-    // 3. RMS AGC.
-    let agc_alpha = (AGC_ALPHA_NUMERATOR / sps) as f32;
-    let agced = rms_agc(&dc_blocked, agc_alpha, AGC_REFERENCE);
+impl FrontEnd {
+    fn compute(audio: &AudioSamples) -> FrontEnd {
+        let fs = audio.sample_rate as f64;
+        let sps = fs / SYMBOL_RATE_HZ;
 
-    // The boxcar and DC-blocker stages are both causal, linear-phase FIR-
-    // style filters with a fixed, exactly-known sample delay; the PFB
-    // interpolator below introduces none (see `pfb_interpolate`'s comment).
-    // `gardner_ted`'s reported symbol positions are otherwise a precise,
-    // direct measurement of the original audio timeline, so subtract this
-    // one systematic offset back out before converting to real time.
-    let total_delay_samples = boxcar_delay_samples + dc_delay_samples;
+        // 1. Boxcar matched filter (matched to the rectangular NRZ pulse).
+        let boxcar_len = (fs / SYMBOL_RATE_HZ).floor().max(1.0) as usize;
+        let matched = boxcar_matched_filter(&audio.samples, boxcar_len);
+        let boxcar_delay_samples = (boxcar_len as f64 - 1.0) / 2.0;
 
+        // 2. DC blocker (cascaded-moving-average highpass).
+        let dc_length = (sps * DC_BLOCKER_LENGTH_SYMBOLS).ceil().max(1.0) as usize;
+        let dc_blocked = dc_blocker(&matched, dc_length);
+        let dc_delay_samples = (2 * dc_length).saturating_sub(2) as f64;
+
+        // 3. RMS AGC.
+        let agc_alpha = (AGC_ALPHA_NUMERATOR / sps) as f32;
+        let agced = rms_agc(&dc_blocked, agc_alpha, AGC_REFERENCE);
+
+        FrontEnd {
+            agced,
+            fs,
+            total_delay_samples: boxcar_delay_samples + dc_delay_samples,
+        }
+    }
+}
+
+fn bitstream_from_front_end(front_end: &FrontEnd, clk_bw: f64) -> BitStream {
     // 4. Gardner timing error detector + PFB-interpolated sampling.
     let (symbols, sample_positions, recovered_rate) =
-        gardner_ted(&agced, fs, SYMBOL_RATE_HZ, clk_bw);
+        gardner_ted(&front_end.agced, front_end.fs, SYMBOL_RATE_HZ, clk_bw);
 
     // 5. Hard decision (slicer): positive deviation → 1, negative → 0
     let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
+    // The boxcar and DC-blocker stages are both causal, linear-phase FIR-
+    // style filters with a fixed, exactly-known sample delay; the PFB
+    // interpolator introduces none (see `pfb_interpolate`'s comment).
+    // `gardner_ted`'s reported symbol positions are otherwise a precise,
+    // direct measurement of the original audio timeline, so subtract this
+    // one systematic offset back out before converting to real time.
     let bit_times_ms: Vec<f64> = sample_positions
         .iter()
-        .map(|&p| (p - total_delay_samples) / fs * 1000.0)
+        .map(|&p| (p - front_end.total_delay_samples) / front_end.fs * 1000.0)
         .collect();
 
     BitStream {
