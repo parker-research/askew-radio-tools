@@ -43,17 +43,26 @@ pub fn decode_file(path: &str) -> Result<Vec<BeaconRecord>, DecodeError> {
 /// decode the file twice).
 ///
 /// Runs the DSP front-end once per gain pair in
-/// [`dsp::GARDNER_GAIN_CANDIDATES`] and merges the decoded frames
-/// (deduplicated by payload bytes). A single fixed symbol-timing loop
-/// bandwidth isn't reliable across a whole multi-minute capture — see the
-/// comment on `gardner_ted` in `dsp.rs` — so trying a few and taking the
-/// union catches real frames that any one gain's phase drift would miss.
+/// [`dsp::GARDNER_GAIN_CANDIDATES`] (whole-file passes), plus the tiled
+/// local re-lock pass ([`dsp::local_relock_bitstreams`]), and merges all
+/// the decoded frames (deduplicated by payload bytes). A single
+/// continuous symbol-timing loop isn't reliable across a whole
+/// multi-minute capture — see the comment on `gardner_ted` and on
+/// `local_relock_bitstreams` in `dsp.rs` — so trying several whole-file
+/// gains *and* many short independently-relocked chunks, then taking the
+/// union, catches real frames that any one continuous pass's phase drift
+/// would miss.
 pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<BeaconRecord> {
     let mut seen_payloads: HashSet<Vec<u8>> = HashSet::new();
     let mut records = Vec::new();
 
-    for &(alpha, beta) in dsp::GARDNER_GAIN_CANDIDATES {
-        let bitstream = dsp::fm_discriminate_and_filter_with_gains(audio, alpha, beta);
+    let mut bitstreams: Vec<dsp::BitStream> = dsp::GARDNER_GAIN_CANDIDATES
+        .iter()
+        .map(|&(alpha, beta)| dsp::fm_discriminate_and_filter_with_gains(audio, alpha, beta))
+        .collect();
+    bitstreams.extend(dsp::local_relock_bitstreams(audio));
+
+    for bitstream in &bitstreams {
         let raw_frames = framing::find_frames(&bitstream.bits);
 
         for raw in &raw_frames {

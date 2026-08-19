@@ -186,6 +186,137 @@ fn biquad_lowpass_group_delay_samples(fs: f64, cutoff_hz: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Anchored local re-lock: bound noise-driven phase random-walk
+// ---------------------------------------------------------------------------
+//
+// `fm_discriminate_and_filter_with_gains` runs the Gardner loop as one
+// continuous pass across the *entire* capture (typically several minutes,
+// millions of symbols, almost all of it noise between brief real bursts).
+// Even a low-bandwidth loop's phase estimate random-walks over that many
+// symbols, so whether it happens to be well-locked during any *particular*
+// burst is essentially arbitrary — [`GARDNER_GAIN_CANDIDATES`] papers over
+// this by trying a few fixed bandwidths, but a burst that all of them
+// happen to mis-track at that point in the file is still a straight miss
+// (confirmed empirically: comparing against gr_satellites' reference
+// decoder on real SatNOGS captures, we were missing real frames it
+// recovers — mostly repeat transmissions of messages we *did* catch at
+// other points in the same file, i.e. exactly the "arbitrary lock quality"
+// signature).
+//
+// A blind fixed-size chunk grid (an earlier version of this pass) doesn't
+// fix this: a chunk boundary falling shortly before a real burst still
+// leaves the loop under-converged (or, with noise ahead of the burst
+// inside the chunk, freshly wandered) right when it matters, and testing
+// against real captures confirmed it recovered zero additional frames.
+//
+// This version anchors each local re-lock window on an *actual* syncword
+// hit instead of a blind grid position: run the existing whole-file gain
+// candidates as usual and collect every position where `find_frames`
+// matched the syncword (within its normal 4-bit-error threshold) — even
+// hits whose *payload* decode later fails, since a sub-4-bit-error match
+// over 32 bits already pins that audio-sample position closely regardless
+// of how much the rest of the frame has drifted by that point in a
+// multi-minute pass. For each such anchor, re-run a *fresh* Gardner loop
+// (zeroed strobe position and integrator) over a short window starting
+// several hundred symbols before it — enough to converge — and ending one
+// frame past it. Because the window is anchored right where the real
+// signal actually is, convergence only has to hold locally for a couple
+// thousand symbols, not for the whole file.
+const RELOCK_PREROLL_SYMBOLS: f64 = 400.0;
+const RELOCK_POSTROLL_SYMBOLS: f64 = 50.0;
+
+/// Loop-filter gains for the anchored re-lock windows. Deliberately
+/// *faster* than [`GARDNER_GAIN_CANDIDATES`]'s low-bandwidth gains: those
+/// are tuned to resist multi-minute noise-driven walk, which isn't a
+/// concern here (windows are a couple thousand symbols), so a quicker
+/// pull-in during the short preroll matters more.
+const RELOCK_GAIN: (f64, f64) = (0.01, 0.001);
+
+/// Run the anchored local re-lock pass described above and return one
+/// [`BitStream`] per candidate window. Each is independently
+/// searched/decoded by the caller exactly like a
+/// [`GARDNER_GAIN_CANDIDATES`] pass — real frames recovered redundantly
+/// from more than one anchor (or already found by the whole-file passes)
+/// are deduplicated downstream by payload bytes.
+pub fn local_relock_bitstreams(audio: &AudioSamples) -> Vec<BitStream> {
+    let fs = audio.sample_rate as f64;
+    let symbol_rate = 9600.0_f64;
+    let sps = fs / symbol_rate;
+    let lpf_cutoff = symbol_rate * 1.5;
+
+    let filtered = lowpass_filter(&audio.samples, fs, lpf_cutoff);
+    let lpf_group_delay_samples = biquad_lowpass_group_delay_samples(fs, lpf_cutoff);
+
+    // 1. Coarse candidate detection: collect every syncword-hit sample
+    // position from the whole-file gain candidates, decoded or not.
+    let mut anchors: Vec<f64> = Vec::new();
+    for &(alpha, beta) in GARDNER_GAIN_CANDIDATES {
+        let (symbols, sample_positions, _recovered_rate) =
+            gardner_ted(&filtered, fs, symbol_rate, alpha, beta);
+        let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
+        for raw in crate::framing::find_frames(&bits) {
+            if let Some(&pos) = sample_positions.get(raw.sync_bit_offset) {
+                anchors.push(pos);
+            }
+        }
+    }
+
+    if anchors.is_empty() {
+        return Vec::new();
+    }
+    anchors.sort_by(f64::total_cmp);
+
+    // Merge anchors within a few symbols of each other — almost certainly
+    // the same real burst, hit by more than one gain candidate. This gap
+    // is deliberately much shorter than any realistic inter-frame spacing
+    // (frames in real captures are at least tens of ms apart) so distinct
+    // back-to-back frames aren't collapsed into one anchor.
+    let merge_gap_samples = 50.0 * sps;
+    let mut merged: Vec<f64> = Vec::new();
+    for pos in anchors {
+        if let Some(&last) = merged.last()
+            && pos - last < merge_gap_samples
+        {
+            continue;
+        }
+        merged.push(pos);
+    }
+
+    // 2. For each anchor, re-run a fresh Gardner loop over a short window
+    // starting well before it and ending one frame past it.
+    let frame_symbols = 32.0 + (crate::fec::ASM_FRAME_LEN_BYTES * 8) as f64;
+    let window_before = RELOCK_PREROLL_SYMBOLS * sps;
+    let window_after = (frame_symbols + RELOCK_POSTROLL_SYMBOLS) * sps;
+
+    let mut out = Vec::new();
+    for anchor in merged {
+        let window_start = (anchor - window_before).max(0.0) as usize;
+        let window_end = ((anchor + window_after) as usize).min(filtered.len());
+        if window_end <= window_start {
+            continue;
+        }
+        let chunk = &filtered[window_start..window_end];
+
+        let (symbols, sample_positions, _recovered_rate) =
+            gardner_ted(chunk, fs, symbol_rate, RELOCK_GAIN.0, RELOCK_GAIN.1);
+
+        let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
+        let bit_times_ms: Vec<f64> = sample_positions
+            .iter()
+            .map(|&p| (p + window_start as f64 - lpf_group_delay_samples) / fs * 1000.0)
+            .collect();
+
+        out.push(BitStream {
+            bits,
+            bit_times_ms,
+            recovered_symbol_rate: symbol_rate,
+        });
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Step 2: Gardner timing error detector
 // ---------------------------------------------------------------------------
 //
