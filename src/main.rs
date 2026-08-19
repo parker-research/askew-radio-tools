@@ -7,10 +7,12 @@
 //! Decoded CSP frames are written to stdout as JSONL (one JSON object per
 //! line, fields: data_length_bytes, time_in_file_ms,
 //! rs_corrected_error_count, rs_correctable, crc_pass, data_hex — plus
-//! filename if `--show-filename` is passed). Frames with uncorrectable
-//! Reed-Solomon errors are still emitted (rs_correctable: false) rather
-//! than dropped, unless filtered out via `--output-filter`. All other
-//! diagnostics go to stderr so stdout stays valid JSONL.
+//! filename if `--show-filename` is passed). By default only "good" frames
+//! are emitted (`OutputFilter::Good`: RS-correctable and no explicit CRC
+//! failure) — pass `--output-filter all` to also see RS-uncorrectable
+//! frames (rs_correctable: false), kept rather than dropped so callers can
+//! see/inspect what was received. All other diagnostics go to stderr so
+//! stdout stays valid JSONL.
 
 use askew_radio_tools::pipeline::BeaconRecord;
 use askew_radio_tools::{audio_check, pipeline};
@@ -56,7 +58,7 @@ struct Cli {
     show_filename: bool,
 
     /// Which decoded frames to emit.
-    #[arg(long, value_enum, default_value_t = OutputFilter::All)]
+    #[arg(long, value_enum, default_value_t = OutputFilter::Good)]
     output_filter: OutputFilter,
 }
 
