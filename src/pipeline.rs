@@ -21,9 +21,10 @@ pub struct BeaconRecord {
     /// best-effort, likely-still-corrupt payload, kept in the output
     /// rather than dropped so callers can see/inspect what was received.
     pub rs_correctable: bool,
-    /// `true`/`false` if the CSP frame's header declares a CRC trailer and
-    /// it matches/doesn't; `None` if the frame doesn't include one (per
-    /// the CSP header's `crc` flag) — there's nothing to check.
+    /// `true`/`false` for whether the frame's trailing CRC32C matches;
+    /// `None` only if the frame is too short to even hold a 4-byte
+    /// trailer. See [`fec::csp_crc32c_check`] for why this doesn't depend
+    /// on the CSP header's `crc` flag.
     pub crc_pass: Option<bool>,
     pub data_hex: String,
 }

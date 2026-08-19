@@ -62,10 +62,10 @@ struct GoodFrame {
 
 /// Build a `GoodFrame` list from `(time_in_file_ms, data_length_bytes,
 /// rs_corrected_error_count, data_hex)` tuples. All the frames these
-/// SatNOGS observations decode to are FrontierSat CSP frames that never
-/// set the header's `crc` flag, so `crc_pass` is always `None` — if a
-/// future fixture needs a real CRC result, this helper will need a
-/// `crc_pass` column too.
+/// SatNOGS observations decode to are FrontierSat CSP frames, which always
+/// carry a valid CRC32C trailer (see `fec::csp_crc32c_check`'s doc comment)
+/// — so every "good" (RS-correctable) frame here is expected to have
+/// `crc_pass: Some(true)`.
 fn good_frames(raw: &[(f64, usize, u32, &str)]) -> Vec<GoodFrame> {
     raw.iter()
         .map(
@@ -73,7 +73,7 @@ fn good_frames(raw: &[(f64, usize, u32, &str)]) -> Vec<GoodFrame> {
                 time_in_file_ms,
                 data_length_bytes,
                 rs_corrected_error_count: Some(rs_corrected_error_count),
-                crc_pass: None,
+                crc_pass: Some(true),
                 data_hex: data_hex.to_string(),
             },
         )

@@ -42,8 +42,10 @@
 //!
 //! CSP-level CRC verification (`crc_pass`) mirrors gr-satellites'
 //! `crcs.crc32c()` helper (`python/crcs.py`), which is `libcsp`'s CRC32C
-//! (Castagnoli) over the frame, present only when the CSP header's `crc`
-//! flag bit is set.
+//! (Castagnoli) over the frame. This project's satellites always append
+//! this trailer, so it's always checked — unlike gr-satellites' own
+//! `csp_header.py`, the CSP header's `crc` flag bit is *not* used to gate
+//! the check (see `csp_crc32c_check`'s doc comment for why).
 
 use crate::DecodeError;
 
@@ -469,29 +471,29 @@ pub fn ax100_asm_golay_decode(
 // CSP-level CRC32C verification
 // ---------------------------------------------------------------------------
 
-/// Check the CSP CRC on a decoded CSP frame, following the `crc` flag bit
-/// in the CSP header (bit 0 of the big-endian 32-bit header word — see
-/// `python/csp_header.py`'s `CSP.crc`).
+/// Check the trailing CRC32C on a decoded CSP frame: the last 4 bytes,
+/// big-endian, over everything before them.
 ///
-/// Returns `None` when there's no CRC to check at all: either the header's
-/// `crc` flag is clear (the frame doesn't include one), or the frame is too
-/// short to even read the 4-byte header and so the flag can't be
-/// determined. Returns `Some(true)`/`Some(false)` when a CRC trailer is
-/// expected and does/doesn't match (including the case where the header
-/// claims one but the frame is too short to actually hold it).
+/// This deliberately does *not* look at the CSP header's `crc` flag bit
+/// (bit 0 of the big-endian 32-bit header word — see `python/csp_header.py`'s
+/// `CSP.crc`) to decide whether a trailer is present. That flag is never set
+/// on frames from this project's satellites (confirmed against every
+/// known-good frame in `tests/real_audio.rs`'s fixtures — the header is a
+/// constant `c2a28a00` throughout), yet every one of those frames still
+/// carries a valid CRC32C trailer. gr-satellites' own decoders bear this
+/// out too: `python/crcs.py`'s `crc32c()` wires up a `crc_check` block
+/// unconditionally in a satellite's flowgraph rather than branching on the
+/// header bit per packet — whether a CRC trailer exists is a static
+/// property of the satellite's protocol, not something the frame itself
+/// signals. So: always check.
+///
+/// Returns `None` only when the frame is too short to hold a 4-byte
+/// trailer at all. Otherwise `Some(true)`/`Some(false)` for whether the
+/// trailer matches.
 pub fn csp_crc32c_check(frame: &[u8]) -> Option<bool> {
     if frame.len() < 4 {
         return None;
     }
-    let header = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
-    let crc_flag = header & 1 != 0;
-    if !crc_flag {
-        return None;
-    }
-    if frame.len() < 8 {
-        return Some(false);
-    }
-
     let (body, crc_bytes) = frame.split_at(frame.len() - 4);
     let stored = u32::from_be_bytes(crc_bytes.try_into().unwrap());
     Some(crc32c::crc32c(body) == stored)
@@ -632,21 +634,14 @@ mod tests {
     }
 
     #[test]
-    fn test_csp_crc_check_no_crc_flag_is_none() {
-        // header with crc bit (LSB) = 0
-        let frame = [0x00u8, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
-        assert_eq!(csp_crc32c_check(&frame), None);
-    }
-
-    #[test]
-    fn test_csp_crc_check_too_short_for_header_is_none() {
+    fn test_csp_crc_check_too_short_for_trailer_is_none() {
         let frame = [0x00u8, 0x00, 0x01];
         assert_eq!(csp_crc32c_check(&frame), None);
     }
 
     #[test]
     fn test_csp_crc_check_valid() {
-        let mut frame = vec![0x00u8, 0x00, 0x00, 0x01]; // crc bit set
+        let mut frame = vec![0x00u8, 0x00, 0x00, 0x01];
         frame.extend_from_slice(b"hello world");
         let crc = crc32c::crc32c(&frame);
         frame.extend_from_slice(&crc.to_be_bytes());
@@ -666,9 +661,20 @@ mod tests {
     }
 
     #[test]
-    fn test_csp_crc_check_flag_set_but_no_room_for_trailer() {
-        // crc bit set, but only 4 bytes total (header only, no trailer)
-        let frame = [0x00u8, 0x00, 0x00, 0x01];
-        assert_eq!(csp_crc32c_check(&frame), Some(false));
+    fn test_csp_crc_check_real_frame_with_unset_header_flag_still_passes() {
+        // Real FrontierSat frame (see tests/real_audio.rs fixtures): header
+        // is c2a28a00, whose `crc` flag bit is clear, yet it still carries
+        // a valid CRC32C trailer — this is exactly the case the header-flag
+        // gating used to get wrong.
+        let hex = "c2a28a0001435453310200b013b501330600004295a96f9e010000030134002b0074\
+                   0500000102ea8f02000000753e63ff7fee03c60e0000a300000094000000d200000083\
+                   000000c00000005f050000030201020000000248656c6c6f2066726f6d204361\
+                   6c67617279546f53706163652046726f6e746965725361740000000000454e\
+                   440026bb1e2e";
+        let frame: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(csp_crc32c_check(&frame), Some(true));
     }
 }
