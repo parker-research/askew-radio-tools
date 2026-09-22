@@ -1,5 +1,10 @@
 # askew-radio-tools
 
+[![crates.io](https://img.shields.io/crates/v/askew-radio-tools.svg)](https://crates.io/crates/askew-radio-tools)
+[![docs.rs](https://img.shields.io/docsrs/askew-radio-tools)](https://docs.rs/askew-radio-tools)
+[![CI](https://github.com/parker-research/askew-radio-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/parker-research/askew-radio-tools/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/askew-radio-tools.svg)](LICENSE)
+
 DSP demodulator for AX100 Mode 5 radio packets, and more, written in Rust.
 
 ## Tools
