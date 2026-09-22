@@ -376,7 +376,10 @@ mod tests {
             classify(&raw, &decoded, Some(false)),
             FrameTier::RsCorrectableCrcError
         );
-        assert_eq!(classify(&raw, &decoded, None), FrameTier::RsCorrectableCrcError);
+        assert_eq!(
+            classify(&raw, &decoded, None),
+            FrameTier::RsCorrectableCrcError
+        );
     }
 
     #[test]
