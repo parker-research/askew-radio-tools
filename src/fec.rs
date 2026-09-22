@@ -405,6 +405,20 @@ pub const ASM_FRAME_LEN_BYTES: usize = HEADER_LEN + NN;
 
 /// Result of decoding one AX100 ASM+Golay frame.
 pub struct AsmGolayDecoded {
+    /// Number of bit errors the Golay(24,12) decoder corrected in the
+    /// 3-byte length/flags header (0..=3). A random 24-bit word lands
+    /// within the code's 3-bit correction radius 56.8% of the time, but
+    /// within 1 bit only 0.6% of the time, so this is a strong
+    /// real-vs-noise discriminator for frames RS can't vouch for.
+    pub golay_corrected_bit_count: u32,
+    /// The Golay-corrected header's flag nibble — bits 8..12 of the
+    /// 12-bit message, i.e. `[unused][RS][scrambler][viterbi]`. The decode
+    /// path ignores these (see below), but callers can use them as a
+    /// plausibility check: a real transmitter emits one constant value.
+    pub header_flags: u8,
+    /// Transmitted on-wire codeword length in bytes (the header's low 8
+    /// bits): `payload.len() + 32` RS parity bytes.
+    pub frame_len: usize,
     /// CSP frame bytes (RS parity stripped). Best-effort: if
     /// `rs_correctable` is `false`, this is the derandomized-but-otherwise-
     /// uncorrected payload (RS detected more errors than it can fix, so
@@ -433,9 +447,10 @@ pub fn ax100_asm_golay_decode(
     frame: &[u8; ASM_FRAME_LEN_BYTES],
 ) -> Result<AsmGolayDecoded, DecodeError> {
     let mut header = ((frame[0] as u32) << 16) | ((frame[1] as u32) << 8) | frame[2] as u32;
-    golay24_decode(&mut header)?;
+    let golay_corrected_bit_count = golay24_decode(&mut header)?;
 
     let frame_len = (header & 0xff) as i32;
+    let header_flags = ((header >> 8) & 0xf) as u8;
     // header bits 8/9/10 (viterbi/scrambler/RS flags) are intentionally
     // ignored here, matching ax100_deframer's fixed viterbi=off, rs=on,
     // scrambler=CCSDS-per-YAML configuration rather than the frame's
@@ -461,6 +476,9 @@ pub fn ax100_asm_golay_decode(
 
     let payload_len = frame_len - NROOTS;
     Ok(AsmGolayDecoded {
+        golay_corrected_bit_count,
+        header_flags,
+        frame_len,
         payload: packet[..payload_len].to_vec(),
         rs_corrected_error_count,
         rs_correctable,

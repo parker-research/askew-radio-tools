@@ -10,7 +10,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use askew_radio_tools::pipeline;
+use askew_radio_tools::pipeline::{self, FrameTier};
 
 fn cache_dir() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -80,13 +80,18 @@ fn good_frames(raw: &[(f64, usize, u32, &str)]) -> Vec<GoodFrame> {
         .collect()
 }
 
-/// Download `url`, decode it, and assert that its "good" (RS-correctable,
-/// no explicit CRC failure) frames exactly match `expected` — pinning the
-/// whole DSP -> framing -> Golay -> RS -> CRC pipeline's current decoding
-/// and timestamp precision against real hardware output, not just
-/// synthetic fixtures. Also asserts at least one RS-uncorrectable frame is
-/// present, confirming that feature actually exercises on real, noisy
-/// audio rather than just existing in the type signature.
+/// Download `url`, decode it, and assert that its [`FrameTier::Verified`]
+/// frames exactly match `expected` — pinning the whole DSP -> framing ->
+/// Golay -> RS -> CRC pipeline's current decoding and timestamp precision
+/// against real hardware output, not just synthetic fixtures.
+///
+/// Also asserts that the tiers below it are populated the way real,
+/// noisy audio populates them: at least one [`FrameTier::Believable`]
+/// frame (so the believability gate isn't so tight that it takes genuine
+/// partially-corrupt bursts with it) and at least one
+/// [`FrameTier::Candidate`] (so the pipeline is still *labelling* weak
+/// candidates rather than quietly dropping them, which is what makes
+/// `--output-filter all` a usable diagnostic).
 ///
 /// If a pipeline change deliberately alters decoding or timestamp
 /// precision, regenerate the relevant fixture with:
@@ -104,16 +109,9 @@ fn assert_pinned_good_frames(url: &str, expected: &[GoodFrame]) {
 
     let records = pipeline::decode_file(path_str).expect("pipeline should run without error");
 
-    // "Good" requires RS correctability, and no *explicit* CRC failure
-    // (crc_pass: Some(false)) — a frame with no CRC field at all
-    // (crc_pass: None) doesn't count against it, since there's nothing to
-    // have failed. RS correctability is what actually establishes the
-    // frame is real; CRC alone isn't a reliable signal on its own, since a
-    // noise-driven RS-uncorrectable frame can still hit a matching CRC (or
-    // lack one) by chance.
     let good: Vec<GoodFrame> = records
         .iter()
-        .filter(|r| r.rs_correctable && r.crc_pass != Some(false))
+        .filter(|r| r.tier == FrameTier::Verified)
         .map(|r| GoodFrame {
             time_in_file_ms: r.time_in_file_ms,
             data_length_bytes: r.data_length_bytes,
@@ -123,12 +121,15 @@ fn assert_pinned_good_frames(url: &str, expected: &[GoodFrame]) {
         })
         .collect();
 
-    let rs_uncorrectable_count = records.iter().filter(|r| !r.rs_correctable).count();
+    let count_at = |tier| records.iter().filter(|r| r.tier == tier).count();
+    let believable = count_at(FrameTier::Believable);
+    let candidates = count_at(FrameTier::Candidate);
     eprintln!(
-        "{path_str}: decoded {} frame(s) total: {} good, {} RS-uncorrectable",
+        "{path_str}: decoded {} frame(s) total: {} verified, {} rs-correctable, {believable} \
+         believable, {candidates} candidate",
         records.len(),
         good.len(),
-        rs_uncorrectable_count
+        count_at(FrameTier::RsCorrectable),
     );
 
     assert_eq!(
@@ -139,9 +140,16 @@ fn assert_pinned_good_frames(url: &str, expected: &[GoodFrame]) {
     );
 
     assert!(
-        rs_uncorrectable_count > 0,
-        "{path_str}: expected at least one RS-uncorrectable frame to be present in the output \
-         (this capture is known to contain noise-triggered syncword matches)"
+        believable > 0,
+        "{path_str}: expected at least one believable-but-RS-uncorrectable frame (this capture \
+         is known to contain real bursts too corrupt for RS to fix, which the tier's syncword \
+         + Golay header checks should still recognise as real)"
+    );
+
+    assert!(
+        candidates > 0,
+        "{path_str}: expected the noise-tier candidates to still be reported — the pipeline \
+         labels weak frames rather than dropping them, and --output-filter all depends on it"
     );
 }
 

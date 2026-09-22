@@ -1,14 +1,14 @@
 # askew-radio-tools
-A Rust-based DSP decoder for AX100 GFSK radio data from CubeSats.
+
+DSP demodulator for AX100 Mode 5 radio packets, and more, written in Rust.
 
 ## Tools
 
-1. `askew_demod_from_file`: Decodes SatNOGS audio captures into JSONL
-beacon frames.
+1. `askew_demod_from_file`: Decodes SatNOGS audio captures into JSONL frames.
 
 ## Future Directions
 
-Please open an Issue if you're interested in any of the following features
+Please open an Issue if you're interested in any of the following features:
 
 1. Implement uplink/modulation of data to packets
 2. Implement more encoding schemes from `gr_satellites` and similar
@@ -26,4 +26,3 @@ On the scale of "quality code" to "quality result", this project likely lies
 a little closer to focusing on the quality of the result, and is backed strongly
 by regression tests. It is heavily developed by the use of AI, for better or
 for worse.
-

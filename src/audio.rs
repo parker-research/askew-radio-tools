@@ -193,7 +193,7 @@ mod tests {
             .collect();
 
         // Write a minimal WAV file to a temp path
-        let path = "/tmp/test_beacon_audio.wav";
+        let path = "/tmp/test_audio.wav";
         write_minimal_wav(path, sample_rate, &pcm).expect("write test WAV");
 
         let audio = load_audio(path).expect("load test WAV");

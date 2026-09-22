@@ -43,6 +43,13 @@ pub const SYNC_THRESHOLD: u32 = 4;
 pub struct RawFrame {
     /// Bit index where the syncword started.
     pub sync_bit_offset: usize,
+    /// Number of bit errors in the matched syncword (0..=[`SYNC_THRESHOLD`]).
+    /// Only ~1 in 10^5 random bit positions matches within the (gr-satellites
+    /// default) threshold of 4, but a multi-minute capture holds millions of
+    /// them, so noise-driven hits are routine — see
+    /// [`crate::pipeline::frame_is_believable`], which uses this to decide
+    /// whether a frame RS couldn't vouch for is worth emitting.
+    pub sync_bit_errors: u32,
     /// The `ASM_FRAME_LEN_BYTES` raw bytes following the syncword.
     pub data: [u8; ASM_FRAME_LEN_BYTES],
 }
@@ -74,6 +81,7 @@ pub fn find_frames(bits: &[bool]) -> Vec<RawFrame> {
                 let data = bits_to_frame(bits, payload_start);
                 frames.push(RawFrame {
                     sync_bit_offset: i,
+                    sync_bit_errors: errors,
                     data,
                 });
             }
@@ -137,6 +145,7 @@ mod tests {
 
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, frame);
+        assert_eq!(frames[0].sync_bit_errors, 0);
     }
 
     #[test]
@@ -149,6 +158,7 @@ mod tests {
 
         let frames = find_frames(&bits);
         assert_eq!(frames.len(), 1, "should tolerate 2 bit errors (<=4)");
+        assert_eq!(frames[0].sync_bit_errors, 2);
     }
 
     #[test]

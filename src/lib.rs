@@ -1,4 +1,4 @@
-//! AX100 "ASM+Golay" beacon decoder for SatNOGS audio captures
+//! AX100 "ASM+Golay" packet decoder for SatNOGS audio captures
 //! (FRONTIERSAT / NORAD 69015 config: `framing: AX100 ASM+Golay`,
 //! `scrambler: CCSDS`, 9600 baud, 3200 Hz deviation).
 //!

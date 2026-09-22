@@ -1,5 +1,5 @@
 //! Audio quality pre-check: assess whether the audio is likely to contain
-//! a decodable AX100 beacon before running the full DSP pipeline.
+//! a decodable AX100 packet before running the full DSP pipeline.
 //!
 //! Checks performed (all grounded in the AX100 config: 9600 baud, modindex
 //! 0.667, so f_dev = 3200 Hz, signal occupies ~±4800 Hz around baseband):

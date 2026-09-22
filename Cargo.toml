@@ -2,7 +2,7 @@
 name = "askew-radio-tools"
 version = "0.2.0"
 edition = "2024"
-description = "AX100 satellite beacon decoder for SatNOGS audio"
+description = "AX100 satellite packet decoder for SatNOGS audio"
 
 [[bin]]
 name = "askew_demod_from_file"
@@ -29,6 +29,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 [dev-dependencies]
 rand = "0.8"
 
-# Only used by the #[ignore]d real-world-audio integration test, to fetch
+# Only used by the real-world-audio integration test, to fetch
 # sample SatNOGS observations over HTTPS.
 ureq = { version = "2", default-features = false, features = ["tls"] }
