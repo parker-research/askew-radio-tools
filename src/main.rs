@@ -12,7 +12,7 @@
 //!
 //! The decoder labels every candidate frame with a `pipeline::FrameTier`
 //! rather than dropping the ones it doesn't believe, and `--output-filter`
-//! picks how much evidence is worth printing. It defaults to `good`
+//! picks how much evidence is worth printing. It defaults to `verified`
 //! (RS-decoded with a verifying CRC32C); loosening it one step at a time
 //! goes `believable` (also real-but-too-corrupt-to-repair bursts), then
 //! `all`, which prints raw syncword hits and is a diagnostic mode, not a
@@ -59,7 +59,7 @@ enum OutputFilter {
     /// verifies (tier "verified").
     ///
     /// The strictest filter, for perfectly good frames only.
-    Good,
+    Verified,
 }
 
 impl OutputFilter {
@@ -69,7 +69,7 @@ impl OutputFilter {
             OutputFilter::All => FrameTier::Candidate,
             OutputFilter::Believable => FrameTier::Believable,
             OutputFilter::RsCorrectableCrcError => FrameTier::RsCorrectableCrcError,
-            OutputFilter::Good => FrameTier::Verified,
+            OutputFilter::Verified => FrameTier::Verified,
         }
     }
 
@@ -93,7 +93,7 @@ struct Cli {
     show_filename: bool,
 
     /// Which decoded frames to emit.
-    #[arg(long, value_enum, default_value_t = OutputFilter::Good)]
+    #[arg(long, value_enum, default_value_t = OutputFilter::Verified)]
     output_filter: OutputFilter,
 }
 

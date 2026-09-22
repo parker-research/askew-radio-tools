@@ -97,7 +97,7 @@ fn good_frames(raw: &[(f64, usize, u32, &str)]) -> Vec<GoodFrame> {
 /// precision, regenerate the relevant fixture with:
 ///
 /// ```sh
-/// cargo run --release -- --output-filter good <path-to-cached-ogg>
+/// cargo run --release -- --output-filter verified <path-to-cached-ogg>
 /// ```
 ///
 /// and eyeball the diff before updating it — the payloads all decode to
