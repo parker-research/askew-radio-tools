@@ -3,6 +3,11 @@ name = "askew-radio-tools"
 version = "0.3.0"
 edition = "2024"
 description = "AX100 satellite packet decoder for SatNOGS audio"
+license = "AGPL-3.0-only"
+repository = "https://github.com/parker-research/askew-radio-tools"
+readme = "README.md"
+keywords = ["satellite", "cubesat", "satnogs", "ax100", "dsp"]
+categories = ["aerospace", "science", "command-line-utilities"]
 
 [[bin]]
 name = "askew_demod_from_file"
