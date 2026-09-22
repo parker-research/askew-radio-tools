@@ -49,12 +49,12 @@ enum OutputFilter {
     /// transmissions, not noise.
     Believable,
     /// Only frames where Reed-Solomon corrected the codeword (tier
-    /// "rs_correctable" and above).
+    /// "rs_correctable_crc_error" and above).
     ///
     /// CRC failures are still included. In practice this tier is empty:
     /// on every capture measured so far, RS success and CRC success
     /// coincide.
-    RsCorrectable,
+    RsCorrectableCrcError,
     /// Only frames that are RS-correctable *and* whose CSP CRC32C trailer
     /// verifies (tier "verified").
     ///
@@ -68,7 +68,7 @@ impl OutputFilter {
         match self {
             OutputFilter::All => FrameTier::Candidate,
             OutputFilter::Believable => FrameTier::Believable,
-            OutputFilter::RsCorrectable => FrameTier::RsCorrectable,
+            OutputFilter::RsCorrectableCrcError => FrameTier::RsCorrectableCrcError,
             OutputFilter::Good => FrameTier::Verified,
         }
     }

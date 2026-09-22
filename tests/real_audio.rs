@@ -129,7 +129,7 @@ fn assert_pinned_good_frames(url: &str, expected: &[GoodFrame]) {
          believable, {candidates} candidate",
         records.len(),
         good.len(),
-        count_at(FrameTier::RsCorrectable),
+        count_at(FrameTier::RsCorrectableCrcError),
     );
 
     assert_eq!(

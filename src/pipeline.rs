@@ -94,7 +94,7 @@ pub enum FrameTier {
     /// Reed-Solomon decoded the codeword, but the CSP CRC32C trailer
     /// didn't verify. On real captures this tier stays empty: RS success
     /// and CRC success have so far always coincided.
-    RsCorrectable,
+    RsCorrectableCrcError,
     /// Reed-Solomon decoded the codeword *and* its CRC32C verifies. The
     /// frame is exactly what the satellite sent.
     Verified,
@@ -109,7 +109,7 @@ impl FrameTier {
             return if crc_pass == Some(true) {
                 FrameTier::Verified
             } else {
-                FrameTier::RsCorrectable
+                FrameTier::RsCorrectableCrcError
             };
         }
 
@@ -348,8 +348,8 @@ mod tests {
     #[test]
     fn test_tiers_are_ordered_weakest_first() {
         assert!(FrameTier::Candidate < FrameTier::Believable);
-        assert!(FrameTier::Believable < FrameTier::RsCorrectable);
-        assert!(FrameTier::RsCorrectable < FrameTier::Verified);
+        assert!(FrameTier::Believable < FrameTier::RsCorrectableCrcError);
+        assert!(FrameTier::RsCorrectableCrcError < FrameTier::Verified);
     }
 
     #[test]
@@ -367,16 +367,16 @@ mod tests {
     }
 
     #[test]
-    fn test_rs_correctable_without_a_matching_crc_is_its_own_tier() {
+    fn test_rs_correctable_crc_error_without_a_matching_crc_is_its_own_tier() {
         let (raw, mut decoded) = clean_header_but_rs_failed();
         decoded.rs_correctable = true;
         decoded.rs_corrected_error_count = Some(0);
 
         assert_eq!(
             classify(&raw, &decoded, Some(false)),
-            FrameTier::RsCorrectable
+            FrameTier::RsCorrectableCrcError
         );
-        assert_eq!(classify(&raw, &decoded, None), FrameTier::RsCorrectable);
+        assert_eq!(classify(&raw, &decoded, None), FrameTier::RsCorrectableCrcError);
     }
 
     #[test]
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_tier_serialises_as_a_snake_case_string() {
-        let json = serde_json::to_string(&FrameTier::RsCorrectable).unwrap();
-        assert_eq!(json, "\"rs_correctable\"");
+        let json = serde_json::to_string(&FrameTier::RsCorrectableCrcError).unwrap();
+        assert_eq!(json, "\"rs_correctable_crc_error\"");
     }
 }
