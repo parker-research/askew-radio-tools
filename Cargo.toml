@@ -32,7 +32,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
+# Random number generation for tests.
 rand = "0.8"
+
+# Temporary file paths for tests.
+tempfile = "3.27.0"
 
 # Only used by the real-world-audio integration test, to fetch
 # sample SatNOGS observations over HTTPS.

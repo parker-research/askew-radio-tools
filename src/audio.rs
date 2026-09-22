@@ -193,10 +193,11 @@ mod tests {
             .collect();
 
         // Write a minimal WAV file to a temp path
-        let path = "/tmp/test_audio.wav";
-        write_minimal_wav(path, sample_rate, &pcm).expect("write test WAV");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("test_audio.wav");
+        write_minimal_wav(&path, sample_rate, &pcm).expect("write test WAV");
 
-        let audio = load_audio(path).expect("load test WAV");
+        let audio = load_audio(path.to_str().unwrap()).expect("load test WAV");
         assert_eq!(audio.sample_rate, sample_rate);
         assert_eq!(audio.channels, 1);
         assert_eq!(audio.samples.len(), num_samples);
@@ -215,15 +216,20 @@ mod tests {
         // Write a 8000 Hz WAV — below the 19200 Hz minimum
         let sample_rate: u32 = 8_000;
         let pcm: Vec<i16> = vec![0i16; 8000];
-        let path = "/tmp/test_low_rate.wav";
-        write_minimal_wav(path, sample_rate, &pcm).expect("write low-rate WAV");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("test_low_rate.wav");
+        write_minimal_wav(&path, sample_rate, &pcm).expect("write low-rate WAV");
 
-        let result = load_audio(path);
+        let result = load_audio(path.to_str().unwrap());
         assert!(matches!(result, Err(DecodeError::SampleRateTooLow { .. })));
     }
 
     /// Write a bare-minimum WAV (PCM, mono, i16) — no external crates needed.
-    fn write_minimal_wav(path: &str, sample_rate: u32, samples: &[i16]) -> std::io::Result<()> {
+    fn write_minimal_wav(
+        path: &std::path::Path,
+        sample_rate: u32,
+        samples: &[i16],
+    ) -> std::io::Result<()> {
         let mut f = std::fs::File::create(path)?;
         let num_samples = samples.len() as u32;
         let data_size = num_samples * 2; // 2 bytes per i16
