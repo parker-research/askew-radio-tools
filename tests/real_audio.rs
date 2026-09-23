@@ -99,6 +99,63 @@ fn good_frames(raw: &[(f64, usize, u32, &str)]) -> Vec<GoodFrame> {
         .collect()
 }
 
+/// Render `frame` the way it's written in the fixtures below, so a decoded
+/// frame list can be pasted straight back into a test. Frames that don't
+/// fit the fixture tuple (missing RS count, or CRC not passing) fall back to
+/// their `Debug` form.
+fn fixture_line(frame: &GoodFrame) -> String {
+    match (frame.rs_corrected_error_count, frame.crc_pass) {
+        (Some(rs_corrected_error_count), Some(true)) => format!(
+            "({:?}, {}, {rs_corrected_error_count}, {:?}),",
+            frame.time_in_file_ms, frame.data_length_bytes, frame.data_hex
+        ),
+        _ => format!("{frame:?},"),
+    }
+}
+
+fn fixture_lines(frames: &[GoodFrame]) -> String {
+    frames
+        .iter()
+        .map(|f| format!("    {}\n", fixture_line(f)))
+        .collect()
+}
+
+/// Describe how `actual` differs from `expected`: frame counts, which
+/// expected frames weren't decoded, which decoded frames weren't expected,
+/// and then both lists in full (in fixture form).
+fn describe_frame_mismatch(expected: &[GoodFrame], actual: &[GoodFrame]) -> String {
+    let missing: Vec<GoodFrame> = expected
+        .iter()
+        .filter(|f| !actual.contains(f))
+        .cloned()
+        .collect();
+    let unexpected: Vec<GoodFrame> = actual
+        .iter()
+        .filter(|f| !expected.contains(f))
+        .cloned()
+        .collect();
+
+    format!(
+        "expected {} verified frame(s), decoded {}\n\
+         \n\
+         {} expected frame(s) not decoded (or decoded differently):\n{}\
+         \n\
+         {} decoded frame(s) not expected:\n{}\
+         \n\
+         full expected list:\n{}\
+         \n\
+         full decoded list:\n{}",
+        expected.len(),
+        actual.len(),
+        missing.len(),
+        fixture_lines(&missing),
+        unexpected.len(),
+        fixture_lines(&unexpected),
+        fixture_lines(expected),
+        fixture_lines(actual),
+    )
+}
+
 /// Download `url` (verifying it against `sha256`), decode it, and assert
 /// that its [`FrameTier::Verified`] frames exactly match `expected` —
 /// pinning the whole DSP -> framing -> Golay -> RS -> CRC pipeline's current
@@ -145,18 +202,22 @@ fn assert_pinned_good_frames(url: &str, sha256: &str, expected: &[GoodFrame]) {
     let believable = count_at(FrameTier::Believable);
     let candidates = count_at(FrameTier::Candidate);
     eprintln!(
-        "{path_str}: decoded {} frame(s) total: {} verified, {} rs-correctable, {believable} \
-         believable, {candidates} candidate",
+        "{path_str}: decoded {} frame(s) total: {} verified (expected {}), {} rs-correctable, \
+         {believable} believable, {candidates} candidate",
         records.len(),
         good.len(),
+        expected.len(),
         count_at(FrameTier::RsCorrectableCrcError),
     );
 
-    assert_eq!(
-        good, expected,
+    assert!(
+        good == expected,
         "{path_str}: decoded 'good' frames no longer match the pinned expectation — if this \
          is a deliberate algorithm/precision change, regenerate the fixture (see \
-         assert_pinned_good_frames' doc comment) and review the diff before updating it"
+         assert_pinned_good_frames' doc comment) and review the diff before updating it\n\
+         \n\
+         {}",
+        describe_frame_mismatch(expected, &good)
     );
 
     assert!(
