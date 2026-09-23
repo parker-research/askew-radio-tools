@@ -5,12 +5,15 @@
 //! against real captures, so it runs by default). Requires network access.
 //!
 //! Downloaded files are cached under `target/test-cache/` (gitignored via
-//! `/target`) so repeated runs don't re-fetch them.
+//! `/target`) so repeated runs don't re-fetch them. Each recording's SHA-256
+//! is pinned, so an upstream change to (or corruption of) a recording fails
+//! loudly instead of showing up as a mysterious decode regression.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use askew_radio_tools::pipeline::{self, FrameTier};
+use sha2::{Digest, Sha256};
 
 fn cache_dir() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -20,13 +23,22 @@ fn cache_dir() -> PathBuf {
     dir
 }
 
-/// Download `url` into the cache dir (if not already present) and return
-/// the local path.
-fn fetch_cached(url: &str) -> PathBuf {
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Download `url` into the cache dir (if not already present with the
+/// expected contents) and return the local path. Panics if the downloaded
+/// file's SHA-256 doesn't match `expected_sha256`.
+fn fetch_cached(url: &str, expected_sha256: &str) -> PathBuf {
     let filename = url.rsplit('/').next().expect("url has a filename");
     let path = cache_dir().join(filename);
 
-    if path.exists() {
+    // A cached file with the wrong hash (e.g. from an older download) is
+    // re-fetched rather than trusted.
+    if let Ok(cached) = std::fs::read(&path)
+        && sha256_hex(&cached) == expected_sha256
+    {
         return path;
     }
 
@@ -39,6 +51,13 @@ fn fetch_cached(url: &str) -> PathBuf {
         .into_reader()
         .read_to_end(&mut bytes)
         .unwrap_or_else(|e| panic!("failed to read response body from {url}: {e}"));
+
+    let actual_sha256 = sha256_hex(&bytes);
+    assert_eq!(
+        actual_sha256, expected_sha256,
+        "{url}: downloaded file's SHA-256 doesn't match the pinned hash — the \
+         recording changed upstream or the download was corrupted"
+    );
 
     let tmp_path = path.with_extension("part");
     std::fs::File::create(&tmp_path)
@@ -80,10 +99,11 @@ fn good_frames(raw: &[(f64, usize, u32, &str)]) -> Vec<GoodFrame> {
         .collect()
 }
 
-/// Download `url`, decode it, and assert that its [`FrameTier::Verified`]
-/// frames exactly match `expected` — pinning the whole DSP -> framing ->
-/// Golay -> RS -> CRC pipeline's current decoding and timestamp precision
-/// against real hardware output, not just synthetic fixtures.
+/// Download `url` (verifying it against `sha256`), decode it, and assert
+/// that its [`FrameTier::Verified`] frames exactly match `expected` —
+/// pinning the whole DSP -> framing -> Golay -> RS -> CRC pipeline's current
+/// decoding and timestamp precision against real hardware output, not just
+/// synthetic fixtures.
 ///
 /// Also asserts that the tiers below it are populated the way real,
 /// noisy audio populates them: at least one [`FrameTier::Believable`]
@@ -103,8 +123,8 @@ fn good_frames(raw: &[(f64, usize, u32, &str)]) -> Vec<GoodFrame> {
 /// and eyeball the diff before updating it — the payloads all decode to
 /// plausible FrontierSat telemetry text, so a change here is either a real
 /// precision/behavior change worth reviewing, or a regression.
-fn assert_pinned_good_frames(url: &str, expected: &[GoodFrame]) {
-    let path = fetch_cached(url);
+fn assert_pinned_good_frames(url: &str, sha256: &str, expected: &[GoodFrame]) {
+    let path = fetch_cached(url, sha256);
     let path_str = path.to_str().expect("cache path is valid UTF-8");
 
     let records = pipeline::decode_file(path_str).expect("pipeline should run without error");
@@ -185,6 +205,7 @@ fn test_satnogs_observation_14813295_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/8/18/17/14813295/satnogs_14813295_2026-08-18T17-05-35.ogg",
+        "c57f7313c1707b1afb9e23b9d7c53fa414f04c5334c50ffd9fbc0e5a5cad3b4b",
         &good_frames(raw),
     );
 }
@@ -208,6 +229,7 @@ fn test_satnogs_observation_14183111_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/5/28/17/14183111/satnogs_14183111_2026-05-28T17-32-37.ogg",
+        "e7b028917323808fdeaf0c178512579afc0093bced63047f7e73916daf39c16d",
         &good_frames(raw),
     );
 }
@@ -227,6 +249,7 @@ fn test_satnogs_observation_15035794_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15035794/satnogs_15035794_2026-09-22T22-45-21.ogg",
+        "41a927f92e1b7b4268655be0c06a0a6d052f493fae59709766c8f9ba73e6d6cf",
         &good_frames(raw),
     );
 }
@@ -248,6 +271,7 @@ fn test_satnogs_observation_15035805_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15035805/satnogs_15035805_2026-09-22T22-46-33.ogg",
+        "1176cb38c48fd607d27564eea68b99fe61d9d95ce3502e46cfee2540fa46cdcd",
         &good_frames(raw),
     );
 }
@@ -263,6 +287,7 @@ fn test_satnogs_observation_15035811_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15035811/satnogs_15035811_2026-09-22T22-47-00.ogg",
+        "97d1ab0f098cad3fe28209617b2ee97fec724bc938e65d49a7c9306f43b41674",
         &good_frames(raw),
     );
 }
@@ -283,6 +308,7 @@ fn test_satnogs_observation_15035900_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15035900/satnogs_15035900_2026-09-22T22-48-58.ogg",
+        "5ee5eb53b5a996733ddde7191e1f549dd348f581547ee23c27deb3c1f6a5e888",
         &good_frames(raw),
     );
 }
@@ -431,6 +457,7 @@ fn test_satnogs_observation_15039637_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15039637/satnogs_15039637_2026-09-22T22-46-31.ogg",
+        "a2b6cd9fec5741eeec75c1a3146fb4a8b4f8fa4e07d84bb0b293d7ecaaaca13f",
         &good_frames(raw),
     );
 }
@@ -593,6 +620,7 @@ fn test_satnogs_observation_15039753_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/11/15039753/satnogs_15039753_2026-09-23T11-03-05.ogg",
+        "f46322f7a47f78754b3e59092d5d20667c13b5fce66783dafd353a6dd6163a38",
         &good_frames(raw),
     );
 }
@@ -646,6 +674,7 @@ fn test_satnogs_observation_15040978_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/12/15040978/satnogs_15040978_2026-09-23T12-05-33.ogg",
+        "fabc3018ffb3e95f13b4d813b80e34e5f31a96d95284de58ae63a4f176f02375",
         &good_frames(raw),
     );
 }
@@ -684,6 +713,7 @@ fn test_satnogs_observation_15040999_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/14/15040999/satnogs_15040999_2026-09-23T14-37-10.ogg",
+        "c617f0819a5e15663a7188795ad4cd8e3d438139ba9b74ee5854c1dcaa89d51d",
         &good_frames(raw),
     );
 }
@@ -857,6 +887,7 @@ fn test_satnogs_observation_15041834_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/20/15041834/satnogs_15041834_2026-09-23T20-52-44.ogg",
+        "cb0182d63f033b9ede09e21704a56ccb7c9e8904a5cf29d6b1a618221c0934a5",
         &good_frames(raw),
     );
 }
@@ -873,6 +904,7 @@ fn test_satnogs_observation_15041859_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/20/15041859/satnogs_15041859_2026-09-23T20-54-50.ogg",
+        "8dc151870965771a5a9f0844ccb7b2e41e858427054eeb3170a4ecb2ede563b6",
         &good_frames(raw),
     );
 }
@@ -886,6 +918,7 @@ fn test_satnogs_observation_15041863_decodes_exact_good_frames() {
 
     assert_pinned_good_frames(
         "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/18/15041863/satnogs_15041863_2026-09-23T18-18-19.ogg",
+        "e422b2d67b329dcfbae24d5b21777451ac9cd0dd681549f3962310fe31ba50cb",
         &good_frames(raw),
     );
 }

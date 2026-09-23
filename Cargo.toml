@@ -41,3 +41,7 @@ tempfile = "3.27.0"
 # Only used by the real-world-audio integration test, to fetch
 # sample SatNOGS observations over HTTPS.
 ureq = { version = "2", default-features = false, features = ["tls"] }
+
+# Only used by the real-world-audio integration test, to verify the
+# downloaded SatNOGS observations against pinned SHA-256 hashes.
+sha2 = "0.10"
