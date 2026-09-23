@@ -525,10 +525,10 @@ fn test_satnogs_observation_15039637_decodes_exact_good_frames() {
     );
 }
 
+/// Observation 15039753 contains serveral segments of back-to-back messages in a bulk file downlink.
 #[test]
 fn test_satnogs_observation_15039753_decodes_exact_good_frames() {
-    // Expected to contain at least 415 real packets; the pipeline currently
-    // recovers far fewer, so this pin is a regression floor, not a target.
+    // TODO: Expected to contain at least 415 real packets. This pin is against regressions; hopefully many more packets one day.
     #[rustfmt::skip]
     let raw: &[(f64, usize, u32, &str)] = &[
         (34699.583, 54, 10, "c2a28a0004b57befcda00100000049020101657874656e6465645f626561636f6e5f626c6f625f763420737563636573730013e9c6a8"),
