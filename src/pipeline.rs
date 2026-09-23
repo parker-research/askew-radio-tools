@@ -339,10 +339,10 @@ fn mean_rssi_db(bit_rssi_db: &[f64]) -> f64 {
     }
     let mean_power: f64 = bit_rssi_db
         .iter()
-        .map(|&db| 10f64.powf(db / 10.0))
+        .map(|&db| libm::pow(10.0, db / 10.0))
         .sum::<f64>()
         / bit_rssi_db.len() as f64;
-    (10.0 * mean_power.log10() * 100.0).round() / 100.0
+    (10.0 * libm::log10(mean_power) * 100.0).round() / 100.0
 }
 
 fn hex_encode(data: &[u8]) -> String {

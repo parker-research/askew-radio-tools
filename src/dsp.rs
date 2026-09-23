@@ -284,7 +284,7 @@ fn local_rssi_db(signal: &[f32], pos: f64, sps: f64) -> f64 {
         .map(|&x| (x as f64) * (x as f64))
         .sum();
     let rms = (sum_sq / (hi - lo) as f64).sqrt();
-    20.0 * (rms + 1e-12).log10()
+    20.0 * libm::log10(rms + 1e-12)
 }
 
 // ---------------------------------------------------------------------------
@@ -472,18 +472,18 @@ fn pi_loop_gains(damping: f64, loop_bw: f64, ted_gain: f64) -> (f64, f64) {
     let zeta_omega_n_t = zeta * omega_n_t;
 
     let k0 = 2.0 / ted_gain;
-    let k1 = (-zeta_omega_n_t).exp();
-    let sinh_zeta_omega_n_t = zeta_omega_n_t.sinh();
+    let k1 = libm::exp(-zeta_omega_n_t);
+    let sinh_zeta_omega_n_t = libm::sinh(zeta_omega_n_t);
 
     let cosx_omega_d_t = match zeta.partial_cmp(&1.0).unwrap() {
         std::cmp::Ordering::Greater => {
             let omega_d_t = omega_n_t * (zeta * zeta - 1.0).sqrt();
-            omega_d_t.cosh()
+            libm::cosh(omega_d_t)
         }
         std::cmp::Ordering::Equal => 1.0,
         std::cmp::Ordering::Less => {
             let omega_d_t = omega_n_t * (1.0 - zeta * zeta).sqrt();
-            omega_d_t.cos()
+            libm::cos(omega_d_t)
         }
     };
 
@@ -665,9 +665,9 @@ fn one_pole_dc_block(input: &[f32], alpha: f32) -> Vec<f32> {
 fn one_pole_dc_block_group_delay_samples(fs: f64, symbol_rate_hz: f64) -> f64 {
     let alpha = MM_DC_BLOCK_ALPHA as f64;
     let phase_at = |omega: f64| -> f64 {
-        let (s, c) = omega.sin_cos();
-        let num_phase = s.atan2(1.0 - c);
-        let den_phase = (alpha * s).atan2(1.0 - alpha * c);
+        let (s, c) = libm::sincos(omega);
+        let num_phase = libm::atan2(s, 1.0 - c);
+        let den_phase = libm::atan2(alpha * s, 1.0 - alpha * c);
         num_phase - den_phase
     };
     let omega0 = 2.0 * std::f64::consts::PI * (symbol_rate_hz / 2.0) / fs;
@@ -755,7 +755,7 @@ mod tests {
 
         // One-pole smoothing (~symbol-rate cutoff) to emulate GFSK's
         // Gaussian pulse shaping.
-        let alpha = 1.0 - (-1.0 / (sps as f32)).exp();
+        let alpha = 1.0 - libm::expf(-1.0 / (sps as f32));
         let mut y = 0.0f32;
         let samples: Vec<f32> = square
             .iter()

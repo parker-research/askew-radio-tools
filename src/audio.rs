@@ -188,7 +188,7 @@ mod tests {
         let pcm: Vec<i16> = (0..num_samples)
             .map(|i| {
                 let t = i as f32 / sample_rate as f32;
-                (f32::sin(TAU * freq * t) * i16::MAX as f32) as i16
+                (libm::sinf(TAU * freq * t) * i16::MAX as f32) as i16
             })
             .collect();
 

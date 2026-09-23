@@ -183,7 +183,7 @@ pub fn check(audio: &AudioSamples) -> AudioMetrics {
         .enumerate()
         .map(|(i, &s)| {
             // Hann window
-            let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / (win_size - 1) as f32).cos();
+            let w = 0.5 - 0.5 * libm::cosf(2.0 * PI * i as f32 / (win_size - 1) as f32);
             s * w
         })
         .collect();
@@ -200,7 +200,7 @@ pub fn check(audio: &AudioSamples) -> AudioMetrics {
     let guard_power = dft_band_power(&windowed, guard_start_bin, guard_end_bin);
 
     // Convert to dB (floor at -120 dB to avoid log(0))
-    let to_db = |p: f32| 10.0 * (p.max(1e-12)).log10();
+    let to_db = |p: f32| 10.0 * libm::log10f(p.max(1e-12));
     let inband_power_db = to_db(inband_power);
     let guard_power_db = to_db(guard_power);
     let estimated_snr_db = inband_power_db - guard_power_db;
@@ -271,7 +271,7 @@ fn dft_band_power(windowed: &[f32], start_bin: usize, end_bin: usize) -> f32 {
         let angle = -2.0 * PI * k as f32 / n;
         let (mut re, mut im) = (0.0f32, 0.0f32);
         for (i, &sample) in windowed.iter().enumerate() {
-            let (sin_a, cos_a) = (angle * i as f32).sin_cos();
+            let (sin_a, cos_a) = libm::sincosf(angle * i as f32);
             re += sample * cos_a;
             im += sample * sin_a;
         }
@@ -295,7 +295,7 @@ mod tests {
     fn make_tone(fs: u32, freq: f32, amp: f32, secs: f32) -> AudioSamples {
         let n = (fs as f32 * secs) as usize;
         let samples = (0..n)
-            .map(|i| amp * (TAU * freq * i as f32 / fs as f32).sin())
+            .map(|i| amp * libm::sinf(TAU * freq * i as f32 / fs as f32))
             .collect();
         AudioSamples {
             samples,

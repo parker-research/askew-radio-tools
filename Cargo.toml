@@ -31,6 +31,10 @@ clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
+# Pure-Rust transcendental math (exp, sin, atan2, ...), so results are bit-identical
+# across platforms instead of depending on the system libm (glibc/macOS/MSVC).
+libm = "0.2.16"
+
 [dev-dependencies]
 # Random number generation for tests.
 rand = "0.8"
