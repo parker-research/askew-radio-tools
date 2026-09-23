@@ -96,7 +96,7 @@ pub struct BitStream {
 // defaults.
 // ---------------------------------------------------------------------------
 
-const SYMBOL_RATE_HZ: f64 = 9600.0;
+pub(crate) const SYMBOL_RATE_HZ: f64 = 9600.0;
 
 /// `_default_clk_rel_bw` — Gardner loop's normalized natural frequency
 /// (`omega_n_norm` in `clock_tracking_loop`), i.e. loop bandwidth relative

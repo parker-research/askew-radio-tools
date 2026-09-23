@@ -132,6 +132,9 @@ impl FrameTier {
 pub struct PacketRecord {
     pub filename: String,
     pub data_length_bytes: usize,
+    /// Start of the frame's syncword, snapped to the nearest two-symbol
+    /// period (2 / 9600 baud ≈ 0.2083 ms) and rounded to 0.001 ms, so it's
+    /// identical across platforms and build profiles.
     pub time_in_file_ms: f64,
     /// How much evidence there is that this frame was really transmitted.
     /// Callers that want only real traffic keep
@@ -253,13 +256,13 @@ fn decode_bitstream(
             continue;
         }
 
-        let time_in_file_ms = bitstream
-            .bit_times_ms
-            .get(raw.sync_bit_offset)
-            .copied()
-            .unwrap_or(0.0);
-        // Round to microsecond precision (i.e. the nearest 0.001 ms).
-        let time_in_file_ms = (time_in_file_ms * 1000.0).round() / 1000.0;
+        let time_in_file_ms = quantize_time_in_file_ms(
+            bitstream
+                .bit_times_ms
+                .get(raw.sync_bit_offset)
+                .copied()
+                .unwrap_or(0.0),
+        );
 
         let frame_end_bit =
             (raw.sync_bit_offset + 32 + raw.data.len() * 8).min(bitstream.bit_rssi_db.len());
@@ -288,6 +291,22 @@ fn decode_bitstream(
             }
         }
     }
+}
+
+/// Snap a frame's start time to the nearest multiple of two symbol periods
+/// (2 / 9600 baud ≈ 0.2083 ms), then round to 3 decimal places (in ms).
+///
+/// The timing loop's sub-symbol interpolation is built on transcendental
+/// float functions whose last-bit results differ between platform math
+/// libraries (glibc vs macOS vs Windows) and between debug and release
+/// builds, so the raw interpolated time isn't reproducible across them.
+/// Snapping to a coarse grid, using only exactly-rounded IEEE operations,
+/// makes the reported time the same everywhere.
+fn quantize_time_in_file_ms(time_in_file_ms: f64) -> f64 {
+    const GRID_SYMBOLS: f64 = 2.0;
+    let grid_steps = (time_in_file_ms * dsp::SYMBOL_RATE_HZ / (GRID_SYMBOLS * 1000.0)).round();
+    let snapped_ms = grid_steps * (GRID_SYMBOLS * 1000.0) / dsp::SYMBOL_RATE_HZ;
+    (snapped_ms * 1000.0).round() / 1000.0
 }
 
 /// Average a frame's per-bit RSSI (dB) values, rounded to 0.01 dB. Averages
@@ -319,6 +338,20 @@ fn hex_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::fec::ASM_FRAME_LEN_BYTES;
+
+    #[test]
+    fn test_quantize_time_in_file_ms_snaps_to_two_symbol_grid() {
+        // Grid step is 2 / 9600 s = 0.208333... ms.
+        assert_eq!(quantize_time_in_file_ms(0.0), 0.0);
+        assert_eq!(quantize_time_in_file_ms(0.1), 0.0);
+        assert_eq!(quantize_time_in_file_ms(0.11), 0.208);
+        assert_eq!(quantize_time_in_file_ms(0.3), 0.208);
+        assert_eq!(quantize_time_in_file_ms(0.32), 0.417);
+        // Sub-symbol jitter around a grid point collapses to the same value.
+        assert_eq!(quantize_time_in_file_ms(150182.85), 150182.917);
+        assert_eq!(quantize_time_in_file_ms(150182.99), 150182.917);
+        assert_eq!(quantize_time_in_file_ms(150183.0), 150182.917);
+    }
 
     /// A frame that is clean on every axis the classifier looks at, but
     /// that RS could not correct — the shape of a real burst received too
