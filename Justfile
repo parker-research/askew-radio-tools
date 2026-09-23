@@ -11,8 +11,9 @@ clippy:
 
 build:
     cargo build --all-targets
+    cargo build --all-targets --release
 
 test:
-    cargo test --all-targets
+    cargo test --all-targets --release
 
 all: fmt check clippy build test
