@@ -78,6 +78,16 @@ impl OutputFilter {
     }
 }
 
+/// Which over-the-air protocol (modulation + framing + FEC) to decode.
+/// More will be added; each variant picks a whole decode chain.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Protocol {
+    /// GomSpace AX100 Mode 5: 2-FSK/GFSK, ASM syncword + Golay(24,12)
+    /// length header, CCSDS scrambler, RS(255,223), CSP with CRC32C.
+    #[value(name = "ax100-mode-5")]
+    Ax100Mode5,
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -95,6 +105,14 @@ struct Cli {
     /// Which decoded frames to emit.
     #[arg(long, value_enum, default_value_t = OutputFilter::Verified)]
     output_filter: OutputFilter,
+
+    /// Transmitter symbol rate, in baud.
+    #[arg(long, default_value_t = 9600, value_parser = clap::value_parser!(u32).range(1..))]
+    baud_rate: u32,
+
+    /// Over-the-air protocol (modulation, framing, and FEC) to decode.
+    #[arg(long, value_enum, default_value_t = Protocol::Ax100Mode5)]
+    protocol: Protocol,
 }
 
 fn main() {
@@ -102,7 +120,7 @@ fn main() {
     let mut had_error = false;
 
     for path in &cli.audio_files {
-        if let Err(e) = decode_and_print(path, cli.show_filename, cli.output_filter) {
+        if let Err(e) = decode_and_print(path, &cli) {
             had_error = true;
             eprintln!("{path}: error: {e}");
         }
@@ -113,16 +131,15 @@ fn main() {
     }
 }
 
-fn decode_and_print(
-    path: &str,
-    show_filename: bool,
-    output_filter: OutputFilter,
-) -> Result<(), askew_radio_tools::DecodeError> {
+fn decode_and_print(path: &str, cli: &Cli) -> Result<(), askew_radio_tools::DecodeError> {
+    let output_filter = cli.output_filter;
     let audio = askew_radio_tools::audio::load_audio(path)?;
     let metrics = audio_check::check(&audio);
     eprintln!("{path}: {}", metrics.verdict);
 
-    let records = pipeline::decode_audio(&audio, path);
+    let records = match cli.protocol {
+        Protocol::Ax100Mode5 => pipeline::decode_audio(&audio, path, f64::from(cli.baud_rate)),
+    };
     let believable = records
         .iter()
         .filter(|r| r.tier >= FrameTier::Believable)
@@ -146,7 +163,7 @@ fn decode_and_print(
         // maps/floats that are NaN/inf), so this is safe to unwrap.
         use std::io::Write;
         let mut value = serde_json::to_value(record).unwrap();
-        if !show_filename {
+        if !cli.show_filename {
             // `.remove()` is a `swap_remove` under the `preserve_order`
             // feature (moves the last field into "filename"'s slot), which
             // would scramble the remaining field order — `shift_remove`

@@ -12,6 +12,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use askew_radio_tools::dsp;
 use askew_radio_tools::pipeline::{self, FrameTier};
 use sha2::{Digest, Sha256};
 
@@ -184,7 +185,8 @@ fn assert_pinned_good_frames(url: &str, sha256: &str, expected: &[GoodFrame]) {
     let path = fetch_cached(url, sha256);
     let path_str = path.to_str().expect("cache path is valid UTF-8");
 
-    let records = pipeline::decode_file(path_str).expect("pipeline should run without error");
+    let records = pipeline::decode_file(path_str, dsp::DEFAULT_SYMBOL_RATE_HZ)
+        .expect("pipeline should run without error");
 
     let good: Vec<GoodFrame> = records
         .iter()

@@ -133,7 +133,7 @@ pub struct PacketRecord {
     pub filename: String,
     pub data_length_bytes: usize,
     /// Start of the frame's syncword, snapped to the nearest two-symbol
-    /// period (2 / 9600 baud ≈ 0.2083 ms) and rounded to 0.001 ms, so it's
+    /// period (e.g. 2 / 9600 baud ≈ 0.2083 ms) and rounded to 0.001 ms, so it's
     /// identical across platforms and build profiles.
     pub time_in_file_ms: f64,
     /// How much evidence there is that this frame was really transmitted.
@@ -181,9 +181,12 @@ pub struct PacketRecord {
 /// multi-minute capture is [`FrameTier::Candidate`] noise, and it is the
 /// caller's job to decide how much evidence it wants (see `main.rs`'s
 /// `--output-filter`, which defaults to [`FrameTier::Verified`] only).
-pub fn decode_file(path: &str) -> Result<Vec<PacketRecord>, DecodeError> {
+///
+/// `baud_rate` is the transmitter's symbol rate in Hz (9600 for
+/// FRONTIERSAT — see [`dsp::DEFAULT_SYMBOL_RATE_HZ`]).
+pub fn decode_file(path: &str, baud_rate: f64) -> Result<Vec<PacketRecord>, DecodeError> {
     let audio = audio::load_audio(path)?;
-    Ok(decode_audio(&audio, path))
+    Ok(decode_audio(&audio, path, baud_rate))
 }
 
 /// Same as [`decode_file`], but operating on already-loaded audio (so
@@ -210,17 +213,31 @@ pub fn decode_file(path: &str) -> Result<Vec<PacketRecord>, DecodeError> {
 /// *and* a structurally different algorithm, then taking the union,
 /// catches frames that no amount of tuning the primary chain alone would
 /// recover.
-pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<PacketRecord> {
+pub fn decode_audio(audio: &AudioSamples, filename: &str, baud_rate: f64) -> Vec<PacketRecord> {
     // payload bytes -> index into `records` of the best decode seen so far.
     let mut best_by_payload: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut records = Vec::new();
 
-    for bitstream in dsp::fm_discriminate_and_filter_multi_bw(audio, dsp::CLK_BW_CANDIDATES) {
-        decode_bitstream(&bitstream, filename, &mut best_by_payload, &mut records);
+    for bitstream in
+        dsp::fm_discriminate_and_filter_multi_bw(audio, baud_rate, dsp::CLK_BW_CANDIDATES)
+    {
+        decode_bitstream(
+            &bitstream,
+            filename,
+            baud_rate,
+            &mut best_by_payload,
+            &mut records,
+        );
     }
 
-    let mm_bitstream = dsp::fm_discriminate_and_filter_mueller_muller(audio);
-    decode_bitstream(&mm_bitstream, filename, &mut best_by_payload, &mut records);
+    let mm_bitstream = dsp::fm_discriminate_and_filter_mueller_muller(audio, baud_rate);
+    decode_bitstream(
+        &mm_bitstream,
+        filename,
+        baud_rate,
+        &mut best_by_payload,
+        &mut records,
+    );
 
     records.sort_by(|a, b| a.time_in_file_ms.total_cmp(&b.time_in_file_ms));
     records
@@ -232,6 +249,7 @@ pub fn decode_audio(audio: &AudioSamples, filename: &str) -> Vec<PacketRecord> {
 fn decode_bitstream(
     bitstream: &dsp::BitStream,
     filename: &str,
+    baud_rate: f64,
     best_by_payload: &mut HashMap<Vec<u8>, usize>,
     records: &mut Vec<PacketRecord>,
 ) {
@@ -262,6 +280,7 @@ fn decode_bitstream(
                 .get(raw.sync_bit_offset)
                 .copied()
                 .unwrap_or(0.0),
+            baud_rate,
         );
 
         let frame_end_bit =
@@ -294,7 +313,7 @@ fn decode_bitstream(
 }
 
 /// Snap a frame's start time to the nearest multiple of two symbol periods
-/// (2 / 9600 baud ≈ 0.2083 ms), then round to 3 decimal places (in ms).
+/// (e.g. 2 / 9600 baud ≈ 0.2083 ms), then round to 3 decimal places (in ms).
 ///
 /// The timing loop's sub-symbol interpolation is built on transcendental
 /// float functions whose last-bit results differ between platform math
@@ -302,10 +321,10 @@ fn decode_bitstream(
 /// builds, so the raw interpolated time isn't reproducible across them.
 /// Snapping to a coarse grid, using only exactly-rounded IEEE operations,
 /// makes the reported time the same everywhere.
-fn quantize_time_in_file_ms(time_in_file_ms: f64) -> f64 {
+fn quantize_time_in_file_ms(time_in_file_ms: f64, baud_rate: f64) -> f64 {
     const GRID_SYMBOLS: f64 = 2.0;
-    let grid_steps = (time_in_file_ms * dsp::SYMBOL_RATE_HZ / (GRID_SYMBOLS * 1000.0)).round();
-    let snapped_ms = grid_steps * (GRID_SYMBOLS * 1000.0) / dsp::SYMBOL_RATE_HZ;
+    let grid_steps = (time_in_file_ms * baud_rate / (GRID_SYMBOLS * 1000.0)).round();
+    let snapped_ms = grid_steps * (GRID_SYMBOLS * 1000.0) / baud_rate;
     (snapped_ms * 1000.0).round() / 1000.0
 }
 
@@ -342,15 +361,15 @@ mod tests {
     #[test]
     fn test_quantize_time_in_file_ms_snaps_to_two_symbol_grid() {
         // Grid step is 2 / 9600 s = 0.208333... ms.
-        assert_eq!(quantize_time_in_file_ms(0.0), 0.0);
-        assert_eq!(quantize_time_in_file_ms(0.1), 0.0);
-        assert_eq!(quantize_time_in_file_ms(0.11), 0.208);
-        assert_eq!(quantize_time_in_file_ms(0.3), 0.208);
-        assert_eq!(quantize_time_in_file_ms(0.32), 0.417);
+        assert_eq!(quantize_time_in_file_ms(0.0, 9600.0), 0.0);
+        assert_eq!(quantize_time_in_file_ms(0.1, 9600.0), 0.0);
+        assert_eq!(quantize_time_in_file_ms(0.11, 9600.0), 0.208);
+        assert_eq!(quantize_time_in_file_ms(0.3, 9600.0), 0.208);
+        assert_eq!(quantize_time_in_file_ms(0.32, 9600.0), 0.417);
         // Sub-symbol jitter around a grid point collapses to the same value.
-        assert_eq!(quantize_time_in_file_ms(150182.85), 150182.917);
-        assert_eq!(quantize_time_in_file_ms(150182.99), 150182.917);
-        assert_eq!(quantize_time_in_file_ms(150183.0), 150182.917);
+        assert_eq!(quantize_time_in_file_ms(150182.85, 9600.0), 150182.917);
+        assert_eq!(quantize_time_in_file_ms(150182.99, 9600.0), 150182.917);
+        assert_eq!(quantize_time_in_file_ms(150183.0, 9600.0), 150182.917);
     }
 
     /// A frame that is clean on every axis the classifier looks at, but

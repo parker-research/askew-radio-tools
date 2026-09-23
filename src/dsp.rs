@@ -70,7 +70,7 @@ use crate::audio::AudioSamples;
 use crate::pfb_taps::PFB_INTERP_TAPS;
 
 /// Output of the DSP front-end: a stream of NRZ bits and the recovered
-/// symbol rate (should be ≈ 9600 Hz).
+/// symbol rate (should be ≈ the nominal baud rate passed in).
 pub struct BitStream {
     /// NRZ bits, MSB first, as recovered by the symbol timing loop.
     pub bits: Vec<bool>,
@@ -85,7 +85,8 @@ pub struct BitStream {
     /// only meaningful as a relative "louder vs. quieter" comparison
     /// between packets.
     pub bit_rssi_db: Vec<f64>,
-    /// Estimated symbol rate after timing recovery (Hz). Should be ≈ 9600.
+    /// Estimated symbol rate after timing recovery (Hz). Should be ≈ the
+    /// nominal baud rate passed in.
     pub recovered_symbol_rate: f64,
 }
 
@@ -96,7 +97,10 @@ pub struct BitStream {
 // defaults.
 // ---------------------------------------------------------------------------
 
-pub(crate) const SYMBOL_RATE_HZ: f64 = 9600.0;
+/// FRONTIERSAT's symbol rate, and the CLI's default `--baud-rate`. Every
+/// entry point below takes the symbol rate explicitly; this is only a
+/// named default.
+pub const DEFAULT_SYMBOL_RATE_HZ: f64 = 9600.0;
 
 /// `_default_clk_rel_bw` — Gardner loop's normalized natural frequency
 /// (`omega_n_norm` in `clock_tracking_loop`), i.e. loop bandwidth relative
@@ -148,15 +152,20 @@ const DC_BLOCKER_LENGTH_SYMBOLS: f64 = 32.0;
 /// running with an alternate bandwidth.
 ///
 /// `samples` must be mono f32 normalised to [-1.0, 1.0] at a sample rate
-/// high enough to represent 9600 baud (≥ 19200 Hz, typically 48000 Hz).
-pub fn fm_discriminate_and_filter(audio: &AudioSamples) -> BitStream {
-    fm_discriminate_and_filter_with_bw(audio, CLK_BW)
+/// high enough to represent `symbol_rate_hz` (≥ 2× it, e.g. ≥ 19200 Hz for
+/// 9600 baud; typically 48000 Hz).
+pub fn fm_discriminate_and_filter(audio: &AudioSamples, symbol_rate_hz: f64) -> BitStream {
+    fm_discriminate_and_filter_with_bw(audio, symbol_rate_hz, CLK_BW)
 }
 
 /// Same as [`fm_discriminate_and_filter`], but with an explicit Gardner
 /// loop bandwidth (see [`CLK_BW_CANDIDATES`]).
-pub fn fm_discriminate_and_filter_with_bw(audio: &AudioSamples, clk_bw: f64) -> BitStream {
-    bitstream_from_front_end(&FrontEnd::compute(audio), clk_bw)
+pub fn fm_discriminate_and_filter_with_bw(
+    audio: &AudioSamples,
+    symbol_rate_hz: f64,
+    clk_bw: f64,
+) -> BitStream {
+    bitstream_from_front_end(&FrontEnd::compute(audio, symbol_rate_hz), clk_bw)
 }
 
 /// Run [`fm_discriminate_and_filter_with_bw`] for every bandwidth in `bws`,
@@ -165,8 +174,12 @@ pub fn fm_discriminate_and_filter_with_bw(audio: &AudioSamples, clk_bw: f64) -> 
 /// `clk_bw` at all, only step 4 does. This is the same output as calling
 /// `fm_discriminate_and_filter_with_bw` once per entry in `bws`, just
 /// without redoing the shared ~2/3 of the work each time.
-pub fn fm_discriminate_and_filter_multi_bw(audio: &AudioSamples, bws: &[f64]) -> Vec<BitStream> {
-    let front_end = FrontEnd::compute(audio);
+pub fn fm_discriminate_and_filter_multi_bw(
+    audio: &AudioSamples,
+    symbol_rate_hz: f64,
+    bws: &[f64],
+) -> Vec<BitStream> {
+    let front_end = FrontEnd::compute(audio, symbol_rate_hz);
     bws.iter()
         .map(|&clk_bw| bitstream_from_front_end(&front_end, clk_bw))
         .collect()
@@ -181,6 +194,7 @@ struct FrontEnd {
     /// kept around only to measure [`BitStream::bit_rssi_db`] from.
     dc_blocked: Vec<f32>,
     fs: f64,
+    symbol_rate_hz: f64,
     sps: f64,
     /// See the comment in [`bitstream_from_front_end`] on why this is
     /// tracked and subtracted back out.
@@ -188,12 +202,12 @@ struct FrontEnd {
 }
 
 impl FrontEnd {
-    fn compute(audio: &AudioSamples) -> FrontEnd {
+    fn compute(audio: &AudioSamples, symbol_rate_hz: f64) -> FrontEnd {
         let fs = audio.sample_rate as f64;
-        let sps = fs / SYMBOL_RATE_HZ;
+        let sps = fs / symbol_rate_hz;
 
         // 1. Boxcar matched filter (matched to the rectangular NRZ pulse).
-        let boxcar_len = (fs / SYMBOL_RATE_HZ).floor().max(1.0) as usize;
+        let boxcar_len = sps.floor().max(1.0) as usize;
         let matched = boxcar_matched_filter(&audio.samples, boxcar_len);
         let boxcar_delay_samples = (boxcar_len as f64 - 1.0) / 2.0;
 
@@ -210,6 +224,7 @@ impl FrontEnd {
             agced,
             dc_blocked,
             fs,
+            symbol_rate_hz,
             sps,
             total_delay_samples: boxcar_delay_samples + dc_delay_samples,
         }
@@ -218,8 +233,12 @@ impl FrontEnd {
 
 fn bitstream_from_front_end(front_end: &FrontEnd, clk_bw: f64) -> BitStream {
     // 4. Gardner timing error detector + PFB-interpolated sampling.
-    let (symbols, sample_positions, recovered_rate) =
-        gardner_ted(&front_end.agced, front_end.fs, SYMBOL_RATE_HZ, clk_bw);
+    let (symbols, sample_positions, recovered_rate) = gardner_ted(
+        &front_end.agced,
+        front_end.fs,
+        front_end.symbol_rate_hz,
+        clk_bw,
+    );
 
     // 5. Hard decision (slicer): positive deviation → 1, negative → 0
     let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
@@ -562,14 +581,17 @@ const MM_MAX_STEP_FRACTION: f64 = 0.25;
 /// Run the alternate Mueller-Müller front-end described above. Meant to be
 /// merged with (not replace) [`fm_discriminate_and_filter`]'s output — see
 /// the module comment above.
-pub fn fm_discriminate_and_filter_mueller_muller(audio: &AudioSamples) -> BitStream {
+pub fn fm_discriminate_and_filter_mueller_muller(
+    audio: &AudioSamples,
+    symbol_rate_hz: f64,
+) -> BitStream {
     let fs = audio.sample_rate as f64;
-    let sps = fs / SYMBOL_RATE_HZ;
+    let sps = fs / symbol_rate_hz;
 
     // 1. DC-block (1-pole HPF) — ahead of the matched filter here, unlike
     // the primary chain.
     let dc_blocked = one_pole_dc_block(&audio.samples, MM_DC_BLOCK_ALPHA);
-    let dc_delay_samples = one_pole_dc_block_group_delay_samples(fs);
+    let dc_delay_samples = one_pole_dc_block_group_delay_samples(fs, symbol_rate_hz);
 
     // 2. Static whole-file RMS AGC (not adaptive/running).
     let rms = {
@@ -608,7 +630,7 @@ pub fn fm_discriminate_and_filter_mueller_muller(audio: &AudioSamples) -> BitStr
             / (sample_positions.len() - 1) as f64;
         fs / mean_sps
     } else {
-        SYMBOL_RATE_HZ
+        symbol_rate_hz
     };
 
     BitStream {
@@ -640,7 +662,7 @@ fn one_pole_dc_block(input: &[f32], alpha: f32) -> Vec<f32> {
 /// *passband* behavior matters, since (unlike a low-pass) the signal band
 /// here sits well above this high-pass's own cutoff (~40 Hz), not below
 /// it.
-fn one_pole_dc_block_group_delay_samples(fs: f64) -> f64 {
+fn one_pole_dc_block_group_delay_samples(fs: f64, symbol_rate_hz: f64) -> f64 {
     let alpha = MM_DC_BLOCK_ALPHA as f64;
     let phase_at = |omega: f64| -> f64 {
         let (s, c) = omega.sin_cos();
@@ -648,7 +670,7 @@ fn one_pole_dc_block_group_delay_samples(fs: f64) -> f64 {
         let den_phase = (alpha * s).atan2(1.0 - alpha * c);
         num_phase - den_phase
     };
-    let omega0 = 2.0 * std::f64::consts::PI * (SYMBOL_RATE_HZ / 2.0) / fs;
+    let omega0 = 2.0 * std::f64::consts::PI * (symbol_rate_hz / 2.0) / fs;
     let h = 1e-4_f64;
     -(phase_at(omega0 + h) - phase_at(omega0 - h)) / (2.0 * h)
 }
@@ -816,7 +838,7 @@ mod tests {
             .map(|i| i.wrapping_mul(2654435761).rotate_left(13) % 5 < 2)
             .collect();
         let audio = make_deviation_audio(48_000, 9600.0, &pattern, 3200.0);
-        let result = fm_discriminate_and_filter(&audio);
+        let result = fm_discriminate_and_filter(&audio, 9600.0);
 
         // Allow ±10% symbol count variation (timing loop startup)
         let expected = pattern.len();
