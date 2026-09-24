@@ -184,6 +184,8 @@ fn describe_frame_mismatch(expected: &[GoodFrame], actual: &[GoodFrame]) -> Stri
 struct Observation {
     url: &'static str,
     sha256: &'static str,
+    /// The transmitter's symbol rate, as passed to `--baud-rate`.
+    baud_rate: f64,
     frames_ndjson: &'static str,
     frame_count: usize,
 }
@@ -212,7 +214,8 @@ impl Observation {
 /// precision, regenerate the relevant fixture with:
 ///
 /// ```sh
-/// cargo run --release -- --output-filter verified target/test-cache/satnogs_<id>_<time>.ogg \
+/// cargo run --release -- --baud-rate <baud_rate> --output-filter verified \
+///     target/test-cache/satnogs_<id>_<time>.ogg \
 ///     | jq -c '{time_in_file_ms, data_length_bytes, rs_corrected_error_count, data_hex}' \
 ///     > tests/real_audio_fixtures/<id>.ndjson
 /// ```
@@ -225,7 +228,7 @@ fn assert_pinned_good_frames(observation: &Observation) {
     let path = observation.fetch();
     let path_str = path.to_str().expect("cache path is valid UTF-8");
 
-    let records = pipeline::decode_file(path_str, dsp::DEFAULT_SYMBOL_RATE_HZ)
+    let records = pipeline::decode_file(path_str, observation.baud_rate)
         .expect("pipeline should run without error");
     let expected: &[GoodFrame] = &good_frames(observation.frames_ndjson);
     assert_eq!(
@@ -284,6 +287,7 @@ fn assert_pinned_good_frames(observation: &Observation) {
 const OBS_14813295: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/8/18/17/14813295/satnogs_14813295_2026-08-18T17-05-35.ogg",
     sha256: "c57f7313c1707b1afb9e23b9d7c53fa414f04c5334c50ffd9fbc0e5a5cad3b4b",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/14813295.ndjson"),
     frame_count: 26,
 };
@@ -296,6 +300,7 @@ fn test_satnogs_observation_14813295_decodes_exact_good_frames() {
 const OBS_14183111: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/5/28/17/14183111/satnogs_14183111_2026-05-28T17-32-37.ogg",
     sha256: "e7b028917323808fdeaf0c178512579afc0093bced63047f7e73916daf39c16d",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/14183111.ndjson"),
     frame_count: 19,
 };
@@ -308,6 +313,7 @@ fn test_satnogs_observation_14183111_decodes_exact_good_frames() {
 const OBS_15035794: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15035794/satnogs_15035794_2026-09-22T22-45-21.ogg",
     sha256: "41a927f92e1b7b4268655be0c06a0a6d052f493fae59709766c8f9ba73e6d6cf",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15035794.ndjson"),
     frame_count: 7,
 };
@@ -320,6 +326,7 @@ fn test_satnogs_observation_15035794_decodes_exact_good_frames() {
 const OBS_15035805: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15035805/satnogs_15035805_2026-09-22T22-46-33.ogg",
     sha256: "1176cb38c48fd607d27564eea68b99fe61d9d95ce3502e46cfee2540fa46cdcd",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15035805.ndjson"),
     frame_count: 9,
 };
@@ -332,6 +339,7 @@ fn test_satnogs_observation_15035805_decodes_exact_good_frames() {
 const OBS_15035811: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15035811/satnogs_15035811_2026-09-22T22-47-00.ogg",
     sha256: "97d1ab0f098cad3fe28209617b2ee97fec724bc938e65d49a7c9306f43b41674",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15035811.ndjson"),
     frame_count: 3,
 };
@@ -344,6 +352,7 @@ fn test_satnogs_observation_15035811_decodes_exact_good_frames() {
 const OBS_15035900: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15035900/satnogs_15035900_2026-09-22T22-48-58.ogg",
     sha256: "5ee5eb53b5a996733ddde7191e1f549dd348f581547ee23c27deb3c1f6a5e888",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15035900.ndjson"),
     frame_count: 8,
 };
@@ -356,6 +365,7 @@ fn test_satnogs_observation_15035900_decodes_exact_good_frames() {
 const OBS_15039637: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/22/22/15039637/satnogs_15039637_2026-09-22T22-46-31.ogg",
     sha256: "a2b6cd9fec5741eeec75c1a3146fb4a8b4f8fa4e07d84bb0b293d7ecaaaca13f",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15039637.ndjson"),
     frame_count: 138,
 };
@@ -368,6 +378,7 @@ fn test_satnogs_observation_15039637_decodes_exact_good_frames() {
 const OBS_15039753: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/11/15039753/satnogs_15039753_2026-09-23T11-03-05.ogg",
     sha256: "f46322f7a47f78754b3e59092d5d20667c13b5fce66783dafd353a6dd6163a38",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15039753.ndjson"),
     frame_count: 382,
 };
@@ -382,6 +393,7 @@ fn test_satnogs_observation_15039753_decodes_exact_good_frames() {
 const OBS_15040978: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/12/15040978/satnogs_15040978_2026-09-23T12-05-33.ogg",
     sha256: "fabc3018ffb3e95f13b4d813b80e34e5f31a96d95284de58ae63a4f176f02375",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15040978.ndjson"),
     frame_count: 42,
 };
@@ -394,6 +406,7 @@ fn test_satnogs_observation_15040978_decodes_exact_good_frames() {
 const OBS_15040999: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/14/15040999/satnogs_15040999_2026-09-23T14-37-10.ogg",
     sha256: "c617f0819a5e15663a7188795ad4cd8e3d438139ba9b74ee5854c1dcaa89d51d",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15040999.ndjson"),
     frame_count: 30,
 };
@@ -406,6 +419,7 @@ fn test_satnogs_observation_15040999_decodes_exact_good_frames() {
 const OBS_15041834: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/20/15041834/satnogs_15041834_2026-09-23T20-52-44.ogg",
     sha256: "cb0182d63f033b9ede09e21704a56ccb7c9e8904a5cf29d6b1a618221c0934a5",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15041834.ndjson"),
     frame_count: 349,
 };
@@ -418,6 +432,7 @@ fn test_satnogs_observation_15041834_decodes_exact_good_frames() {
 const OBS_15041859: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/20/15041859/satnogs_15041859_2026-09-23T20-54-50.ogg",
     sha256: "8dc151870965771a5a9f0844ccb7b2e41e858427054eeb3170a4ecb2ede563b6",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15041859.ndjson"),
     frame_count: 4,
 };
@@ -430,6 +445,7 @@ fn test_satnogs_observation_15041859_decodes_exact_good_frames() {
 const OBS_15041863: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/23/18/15041863/satnogs_15041863_2026-09-23T18-18-19.ogg",
     sha256: "e422b2d67b329dcfbae24d5b21777451ac9cd0dd681549f3962310fe31ba50cb",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15041863.ndjson"),
     frame_count: 0,
 };
@@ -444,6 +460,7 @@ fn test_satnogs_observation_15041863_decodes_exact_good_frames() {
 const OBS_15046793: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/24/16/15046793/satnogs_15046793_2026-09-24T16-59-39.ogg",
     sha256: "b44f28f72787f106bc3d7a7221ab881043a75b77ced80b3e74fc42ebb89be849",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15046793.ndjson"),
     frame_count: 374,
 };
@@ -456,6 +473,7 @@ fn test_satnogs_observation_15046793_decodes_exact_good_frames() {
 const OBS_15046795: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/24/16/15046795/satnogs_15046795_2026-09-24T16-58-16.ogg",
     sha256: "beb741209f6ac785e8deaef7d8b410d6ddad44de80de8e851b7d2504e567d12b",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15046795.ndjson"),
     frame_count: 163,
 };
@@ -468,6 +486,7 @@ fn test_satnogs_observation_15046795_decodes_exact_good_frames() {
 const OBS_15046840: Observation = Observation {
     url: "https://network-satnogs.freetls.fastly.net/media/data_obs/2026/9/24/16/15046840/satnogs_15046840_2026-09-24T16-25-23.ogg",
     sha256: "e19c1c25b0fcc34513ac66e8de353816207d1137f5a939b0e8c1788114f0bed0",
+    baud_rate: dsp::DEFAULT_SYMBOL_RATE_HZ,
     frames_ndjson: include_str!("real_audio_fixtures/15046840.ndjson"),
     frame_count: 27,
 };
