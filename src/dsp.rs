@@ -64,8 +64,6 @@
 //! signal, positive values meaning the "mark" tone and negative values the
 //! "space" tone.
 
-use std::collections::VecDeque;
-
 use crate::audio::AudioSamples;
 use crate::pfb_taps::PFB_INTERP_TAPS;
 
@@ -309,12 +307,12 @@ fn boxcar_matched_filter(input: &[f32], taps_len: usize) -> Vec<f32> {
     }
     let mut out = Vec::with_capacity(input.len());
     let mut sum = 0.0f32;
-    let mut window: VecDeque<f32> = VecDeque::with_capacity(taps_len);
-    for &x in input {
-        window.push_back(x);
+    for (i, &x) in input.iter().enumerate() {
         sum += x;
-        if window.len() > taps_len {
-            sum -= window.pop_front().unwrap();
+        // The sample leaving the `taps_len`-long window (read straight
+        // from `input` rather than kept in a separate queue).
+        if i >= taps_len {
+            sum -= input[i - taps_len];
         }
         out.push(sum / taps_len as f32);
     }
@@ -325,6 +323,35 @@ fn boxcar_matched_filter(input: &[f32], taps_len: usize) -> Vec<f32> {
 // Step 2: DC blocker (literal port of gr-filter's dc_blocker_ff, long_form)
 // ---------------------------------------------------------------------------
 
+/// Fixed delay of `delay` samples, zero-initialised: each
+/// [`push`](Self::push) returns the sample pushed `delay` calls earlier
+/// (a ring buffer, so nothing is shifted per sample).
+struct DelayLine {
+    buf: Vec<f32>,
+    pos: usize,
+}
+
+impl DelayLine {
+    fn new(delay: usize) -> Self {
+        DelayLine {
+            buf: vec![0.0f32; delay],
+            pos: 0,
+        }
+    }
+
+    fn push(&mut self, x: f32) -> f32 {
+        if self.buf.is_empty() {
+            return x;
+        }
+        let out = std::mem::replace(&mut self.buf[self.pos], x);
+        self.pos += 1;
+        if self.pos == self.buf.len() {
+            self.pos = 0;
+        }
+        out
+    }
+}
+
 /// Port of `gr::filter::moving_averager_f`: an efficient recursive
 /// D-sample moving average that also exposes the raw input delayed by
 /// `D - 1` samples (`delayed_sig`).
@@ -333,7 +360,7 @@ struct MovingAverager {
     out: f32,
     out_d1: f32,
     out_d2: f32,
-    delay_line: VecDeque<f32>,
+    delay_line: DelayLine,
 }
 
 impl MovingAverager {
@@ -343,14 +370,13 @@ impl MovingAverager {
             out: 0.0,
             out_d1: 0.0,
             out_d2: 0.0,
-            delay_line: VecDeque::from(vec![0.0f32; length.saturating_sub(1)]),
+            delay_line: DelayLine::new(length.saturating_sub(1)),
         }
     }
 
     fn filter(&mut self, x: f32) -> f32 {
         self.out_d1 = self.out;
-        self.delay_line.push_back(x);
-        self.out = self.delay_line.pop_front().unwrap_or(0.0);
+        self.out = self.delay_line.push(x);
 
         let y = x - self.out_d1 + self.out_d2;
         self.out_d2 = y;
@@ -375,7 +401,7 @@ fn dc_blocker(input: &[f32], length: usize) -> Vec<f32> {
     let mut ma1 = MovingAverager::new(length);
     let mut ma2 = MovingAverager::new(length);
     let mut ma3 = MovingAverager::new(length);
-    let mut delay_line: VecDeque<f32> = VecDeque::from(vec![0.0f32; length.saturating_sub(1)]);
+    let mut delay_line = DelayLine::new(length.saturating_sub(1));
 
     let mut out = Vec::with_capacity(input.len());
     for &x in input {
@@ -384,8 +410,7 @@ fn dc_blocker(input: &[f32], length: usize) -> Vec<f32> {
         let y3 = ma2.filter(y2);
         let y4 = ma3.filter(y3);
 
-        delay_line.push_back(ma0.delayed_sig());
-        let d = delay_line.pop_front().unwrap_or(0.0);
+        let d = delay_line.push(ma0.delayed_sig());
 
         out.push(d - y4);
     }
@@ -446,6 +471,15 @@ fn pfb_interpolate(input: &[f32], pos: f64) -> f32 {
     let taps = &PFB_INTERP_TAPS[arm.min(PFB_INTERP_TAPS.len() - 1)];
 
     let mut acc = 0.0f32;
+    // Fast path: all 8 taps' samples in range, so no per-tap bounds checks
+    // (same products, summed in the same order, as the general loop below).
+    if base >= 3 && ((base + 4) as usize) < input.len() {
+        let window = &input[(base - 3) as usize..=(base + 4) as usize];
+        for (&tap, &x) in taps.iter().zip(window.iter().rev()) {
+            acc += tap * x;
+        }
+        return acc;
+    }
     for (k, &tap) in taps.iter().enumerate() {
         let idx = base + 4 - k as i64;
         if idx >= 0 && (idx as usize) < input.len() {
@@ -607,19 +641,40 @@ pub fn fm_discriminate_and_filter_ensemble(
     ff_windows_symbols: &[usize],
 ) -> Vec<BitStream> {
     let front_end = FrontEnd::compute(audio, symbol_rate_hz);
-    clk_bws
+    let mut bitstreams: Vec<BitStream> = clk_bws
         .iter()
         .map(|&clk_bw| bitstream_from_front_end(&front_end, clk_bw))
-        .chain(
-            ff_windows_symbols
-                .iter()
-                .map(|&w| feedforward_bitstream(&front_end, w)),
-        )
-        .collect()
+        .collect();
+
+    // The feed-forward passes' prefix sums don't depend on the window
+    // length, so they're computed once (and only if some pass needs them),
+    // and dropped before any of those passes' bitstreams are built.
+    let ff_strobes: Vec<Vec<f64>> = {
+        let n = front_end.agced.len();
+        let mut prefix: Option<FeedforwardPrefix> = None;
+        ff_windows_symbols
+            .iter()
+            .map(|&w| {
+                if !feedforward_window_fits(n, front_end.sps, w) {
+                    return Vec::new();
+                }
+                let prefix = prefix.get_or_insert_with(|| {
+                    FeedforwardPrefix::compute(&front_end.agced, front_end.sps)
+                });
+                feedforward_strobes(prefix, front_end.sps, w)
+            })
+            .collect()
+    };
+    bitstreams.extend(
+        ff_strobes
+            .into_iter()
+            .map(|strobes| feedforward_bitstream(&front_end, strobes)),
+    );
+    bitstreams
 }
 
-fn feedforward_bitstream(front_end: &FrontEnd, window_symbols: usize) -> BitStream {
-    let sample_positions = feedforward_strobes(&front_end.agced, front_end.sps, window_symbols);
+/// Sample `front_end` at `sample_positions` (from [`feedforward_strobes`]).
+fn feedforward_bitstream(front_end: &FrontEnd, sample_positions: Vec<f64>) -> BitStream {
     let symbols: Vec<f32> = sample_positions
         .iter()
         .map(|&p| pfb_interpolate(&front_end.agced, p))
@@ -650,8 +705,87 @@ fn feedforward_bitstream(front_end: &FrontEnd, window_symbols: usize) -> BitStre
     }
 }
 
-/// Symbol strobe positions (fractional sample indices into `signal`) from
-/// Oerder-Meyr square-law timing estimation over a centred moving window.
+/// [`feedforward_strobes`]'s averaging window, in samples.
+fn feedforward_window_samples(sps: f64, window_symbols: usize) -> usize {
+    ((window_symbols as f64 * sps).round() as usize).max(1)
+}
+
+/// Whether an `n`-sample signal is long enough for a `window_symbols`
+/// feed-forward window (shorter signals yield no strobes at all).
+fn feedforward_window_fits(n: usize, sps: f64, window_symbols: usize) -> bool {
+    n >= feedforward_window_samples(sps, window_symbols) + 2 * sps.ceil() as usize
+}
+
+/// Prefix sums of `signal[m]^2 * exp(-j*2*pi*m/sps)` (real and imaginary
+/// parts, `signal.len() + 1` entries each, starting at 0), in f64 so the
+/// running sum stays exact enough over a multi-minute capture. They don't
+/// depend on the averaging window, so every window length shares one.
+struct FeedforwardPrefix {
+    re: Vec<f64>,
+    im: Vec<f64>,
+}
+
+impl FeedforwardPrefix {
+    fn compute(signal: &[f32], sps: f64) -> Self {
+        let n = signal.len();
+        let omega = 2.0 * std::f64::consts::PI / sps;
+        let mut re = Vec::with_capacity(n + 1);
+        let mut im = Vec::with_capacity(n + 1);
+        let (mut acc_re, mut acc_im) = (0.0f64, 0.0f64);
+        re.push(0.0);
+        im.push(0.0);
+        let mut sincos = SincosCache::new();
+        for (m, &x) in signal.iter().enumerate() {
+            let power = (x as f64) * (x as f64);
+            // Reduce the angle modulo one cycle before calling sincos, so the
+            // argument stays small (and the result reproducible) however long
+            // the file is.
+            let cycles = m as f64 / sps;
+            let (s, c) = sincos.get(omega * sps * (cycles - cycles.floor()));
+            acc_re += power * c;
+            acc_im -= power * s;
+            re.push(acc_re);
+            im.push(acc_im);
+        }
+        FeedforwardPrefix { re, im }
+    }
+}
+
+/// Memoised [`libm::sincos`], for [`FeedforwardPrefix::compute`]: the
+/// per-sample angles there cycle through only a few distinct values (one
+/// per sample phase within a symbol, per power-of-two range of the sample
+/// index), so nearly every call repeats an earlier one. A direct-mapped
+/// table keyed on the argument's exact bits returns exactly what `sincos`
+/// would, just without recomputing it.
+struct SincosCache {
+    entries: [(u64, (f64, f64)); Self::SIZE],
+}
+
+impl SincosCache {
+    const SIZE: usize = 256;
+
+    fn new() -> Self {
+        // Every slot starts out holding a genuine entry (for 0.0), so a
+        // lookup never needs a separate "empty" check.
+        SincosCache {
+            entries: [(0.0f64.to_bits(), libm::sincos(0.0)); Self::SIZE],
+        }
+    }
+
+    fn get(&mut self, x: f64) -> (f64, f64) {
+        let bits = x.to_bits();
+        let slot = (bits.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize % Self::SIZE;
+        let entry = &mut self.entries[slot];
+        if entry.0 != bits {
+            *entry = (bits, libm::sincos(x));
+        }
+        entry.1
+    }
+}
+
+/// Symbol strobe positions (fractional sample indices into the `signal`
+/// that `prefix` was computed from) from Oerder-Meyr square-law timing
+/// estimation over a centred moving window.
 ///
 /// At each sample `n`, `C[n]` is the window-average of `signal[m]^2 *
 /// exp(-j*2*pi*m/sps)`; for a matched-filtered NRZ signal the squared
@@ -661,33 +795,13 @@ fn feedforward_bitstream(front_end: &FrontEnd, window_symbols: usize) -> BitStre
 /// local phase grid is nearest a nominal one-symbol step — so a slowly
 /// drifting phase (sample-clock offset, residual Doppler) is followed
 /// without ever having to unwrap it explicitly.
-fn feedforward_strobes(signal: &[f32], sps: f64, window_symbols: usize) -> Vec<f64> {
-    let n = signal.len();
-    let window = ((window_symbols as f64 * sps).round() as usize).max(1);
-    if n < window + 2 * sps.ceil() as usize {
-        return Vec::new();
-    }
+fn feedforward_strobes(prefix: &FeedforwardPrefix, sps: f64, window_symbols: usize) -> Vec<f64> {
+    let n = prefix.re.len() - 1;
+    let window = feedforward_window_samples(sps, window_symbols);
+    debug_assert!(feedforward_window_fits(n, sps, window_symbols));
 
-    // Prefix sums of signal^2 * exp(-j*2*pi*m/sps), in f64 so the running
-    // sum stays exact enough over a multi-minute capture.
     let omega = 2.0 * std::f64::consts::PI / sps;
-    let mut prefix_re = Vec::with_capacity(n + 1);
-    let mut prefix_im = Vec::with_capacity(n + 1);
-    let (mut acc_re, mut acc_im) = (0.0f64, 0.0f64);
-    prefix_re.push(0.0);
-    prefix_im.push(0.0);
-    for (m, &x) in signal.iter().enumerate() {
-        let power = (x as f64) * (x as f64);
-        // Reduce the angle modulo one cycle before calling sincos, so the
-        // argument stays small (and the result reproducible) however long
-        // the file is.
-        let cycles = m as f64 / sps;
-        let (s, c) = libm::sincos(omega * sps * (cycles - cycles.floor()));
-        acc_re += power * c;
-        acc_im -= power * s;
-        prefix_re.push(acc_re);
-        prefix_im.push(acc_im);
-    }
+    let (prefix_re, prefix_im) = (&prefix.re, &prefix.im);
     let half = window / 2;
     let phase_at = |center: usize| -> f64 {
         let lo = center.saturating_sub(half);
@@ -1060,6 +1174,40 @@ mod tests {
         // Zero-padded history means only the last sample sees the full window.
         assert!((out[4] - 1.0).abs() < 1e-6);
         assert!((out[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_pfb_interpolate_fast_path_matches_bounds_checked_sum() {
+        let input: Vec<f32> = (0..40).map(|i| libm::sinf(i as f32 * 0.7) * 3.0).collect();
+        for step in 0..400 {
+            let pos = step as f64 * 0.1 - 2.0;
+            let base = pos.floor();
+            let arm = (((pos - base) as f32) * PFB_N_FILTERS as f32).round() as usize;
+            let taps = &PFB_INTERP_TAPS[arm.min(PFB_INTERP_TAPS.len() - 1)];
+            let mut expected = 0.0f32;
+            for (k, &tap) in taps.iter().enumerate() {
+                let idx = base as i64 + 4 - k as i64;
+                if idx >= 0 && (idx as usize) < input.len() {
+                    expected += tap * input[idx as usize];
+                }
+            }
+            assert_eq!(pfb_interpolate(&input, pos).to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn test_sincos_cache_matches_libm_exactly() {
+        let mut cache = SincosCache::new();
+        for sps in [5.0, 48000.0 / 1200.0, 44100.0 / 9600.0] {
+            let omega = 2.0 * std::f64::consts::PI / sps;
+            for m in (0..5000).chain(10_000_000..10_005_000) {
+                let cycles = m as f64 / sps;
+                let x = omega * sps * (cycles - cycles.floor());
+                let (s, c) = cache.get(x);
+                let (es, ec) = libm::sincos(x);
+                assert_eq!((s.to_bits(), c.to_bits()), (es.to_bits(), ec.to_bits()));
+            }
+        }
     }
 
     #[test]
