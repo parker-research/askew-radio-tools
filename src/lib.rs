@@ -7,6 +7,14 @@
 //!   Audio (WAV/OGG) → LPF → symbol timing → bit decisions →
 //!   syncword search → Golay(24,12) length header → CCSDS derandomize →
 //!   Reed-Solomon (255,223) → CSP frame → CSP CRC-32C check
+//!
+//! On top of that reference chain, to recover more of what's actually in
+//! a noisy capture (see [`pipeline::decode_audio`]): an ensemble of timing
+//! recovery methods, soft-decision (erasure) Reed-Solomon decoding,
+//! following runs of back-to-back frames to find ones whose syncword or
+//! header is too damaged to search for, and combining retransmissions of
+//! the same frame. Every frame reported as verified still has to pass
+//! Reed-Solomon and its CSP CRC-32C.
 
 pub mod audio;
 pub mod audio_check;

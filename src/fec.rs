@@ -123,6 +123,33 @@ fn golay24_decode(data: &mut u32) -> Result<u32, DecodeError> {
     Err(DecodeError::GolayFailed)
 }
 
+/// Golay(24,12)-encode a 12-bit message, per `lib/golay24.c`'s
+/// `encode_golay24` convention (`parity << 12 | message`).
+fn golay24_encode(data12: u32) -> u32 {
+    let r = data12 & 0xfff;
+    let mut s: u32 = 0;
+    for h in GOLAY_H.iter() {
+        s <<= 1;
+        s |= (h & r).count_ones() & 1;
+    }
+    ((s & 0xfff) << GOLAY_N) | r
+}
+
+/// How many bits `frame`'s received 3-byte header differs from a clean
+/// header announcing `frame_len` with flag nibble `header_flags`. For a
+/// header Golay decoded, this is the number of bits it corrected; for one
+/// it couldn't (or decoded to a length that was then overridden), it's the
+/// honest count of how far the received bits were from the length used.
+pub fn header_bit_errors(
+    frame: &[u8; ASM_FRAME_LEN_BYTES],
+    frame_len: usize,
+    header_flags: u8,
+) -> u32 {
+    let received = ((frame[0] as u32) << 16) | ((frame[1] as u32) << 8) | frame[2] as u32;
+    let clean = golay24_encode(((header_flags as u32 & 0xf) << 8) | (frame_len as u32 & 0xff));
+    (received ^ clean).count_ones()
+}
+
 // ---------------------------------------------------------------------------
 // CCSDS randomizer (port of lib/randomizer.c)
 // ---------------------------------------------------------------------------
@@ -172,6 +199,12 @@ struct GfTables {
 }
 
 impl GfTables {
+    /// The tables, built once per process.
+    fn get() -> &'static GfTables {
+        static TABLES: std::sync::OnceLock<GfTables> = std::sync::OnceLock::new();
+        TABLES.get_or_init(GfTables::new)
+    }
+
     fn new() -> Self {
         let mut alpha_to = [0u8; 256];
         let mut index_of = [0u8; 256];
@@ -201,29 +234,40 @@ fn modnn(mut x: i32) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Reed-Solomon decode (port of decode_rs.h, specialised to no_eras=0)
+// Reed-Solomon decode (port of decode_rs.h, including its erasure support)
 // ---------------------------------------------------------------------------
 
 /// Decode `data` (the `NN - pad` real symbols, i.e. the tail of a virtual
 /// `NN`-symbol codeword whose first `pad` symbols are implicitly zero) in
 /// place. Returns the number of corrected symbols, or `-1` if uncorrectable.
-fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize) -> i32 {
+///
+/// `erasures` lists indices into `data` of symbols known (or suspected) to
+/// be unreliable. Each costs half an error's worth of the code's
+/// redundancy — `2 * errors + erasures <= NROOTS` is correctable — so
+/// erasing the right symbols stretches RS well past its 16-error
+/// hard-decision limit. Erasing correct symbols costs capacity but never
+/// correctness, and duplicates or out-of-range indices must not be passed.
+fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize, erasures: &[usize]) -> i32 {
+    match rs_syndromes(gf, data, pad) {
+        // Zero syndrome: data is already a valid codeword.
+        None => 0,
+        Some(s) => decode_rs8_from_syndromes(gf, data, pad, erasures, &s),
+    }
+}
+
+/// The syndromes of `data` (a shortened codeword, as for [`decode_rs8`]),
+/// in index form — or `None` if they're all zero, i.e. `data` is already a
+/// valid codeword. They depend only on the received symbols, not on which
+/// of them are erased, so a caller retrying one codeword with several
+/// erasure sets computes them once.
+fn rs_syndromes(gf: &GfTables, data: &[u8], pad: usize) -> Option<[u8; NROOTS]> {
     let n_data = NN - pad;
     debug_assert_eq!(data.len(), n_data);
-
     let alpha_to = &gf.alpha_to;
     let index_of = &gf.index_of;
 
-    let mut lambda = [0u8; NROOTS + 1];
+    // Evaluate data(x) at the NROOTS code roots.
     let mut s = [0u8; NROOTS];
-    let mut b = [0u8; NROOTS + 1];
-    let mut t = [0u8; NROOTS + 1];
-    let mut omega = [0u8; NROOTS + 1];
-    let mut root = [0i32; NROOTS];
-    let mut reg = [0u8; NROOTS + 1];
-    let mut loc = [0i32; NROOTS];
-
-    // --- Syndromes: evaluate data(x) at the NROOTS code roots ---
     for slot in s.iter_mut() {
         *slot = data[0];
     }
@@ -240,23 +284,56 @@ fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize) -> i32 {
     }
 
     let mut syn_error = 0u8;
-    for i in 0..NROOTS {
-        syn_error |= s[i];
-        s[i] = index_of[s[i] as usize];
+    for slot in s.iter_mut() {
+        syn_error |= *slot;
+        *slot = index_of[*slot as usize];
     }
-    if syn_error == 0 {
-        // Zero syndrome: data is already a valid codeword.
-        return 0;
-    }
+    (syn_error != 0).then_some(s)
+}
+
+/// The rest of [`decode_rs8`], given `data`'s (non-zero) syndromes from
+/// [`rs_syndromes`].
+fn decode_rs8_from_syndromes(
+    gf: &GfTables,
+    data: &mut [u8],
+    pad: usize,
+    erasures: &[usize],
+    s: &[u8; NROOTS],
+) -> i32 {
+    let alpha_to = &gf.alpha_to;
+    let index_of = &gf.index_of;
+
+    let mut lambda = [0u8; NROOTS + 1];
+    let mut b = [0u8; NROOTS + 1];
+    let mut t = [0u8; NROOTS + 1];
+    let mut omega = [0u8; NROOTS + 1];
+    let mut root = [0i32; NROOTS];
+    let mut reg = [0u8; NROOTS + 1];
+    let mut loc = [0i32; NROOTS];
 
     lambda[0] = 1;
+    let no_eras = erasures.len().min(NROOTS);
+    if no_eras > 0 {
+        // Initialise lambda to the erasure locator polynomial. Positions
+        // are in full-codeword terms (the `pad` implicit zeros included).
+        lambda[1] = alpha_to[modnn(PRIM * (NN as i32 - 1 - (erasures[0] + pad) as i32)) as usize];
+        for (i, &erasure) in erasures.iter().enumerate().take(no_eras).skip(1) {
+            let u = modnn(PRIM * (NN as i32 - 1 - (erasure + pad) as i32)) as i32;
+            for j in (1..=i + 1).rev() {
+                let tmp = index_of[lambda[j - 1] as usize];
+                if tmp != A0 {
+                    lambda[j] ^= alpha_to[modnn(u + tmp as i32) as usize];
+                }
+            }
+        }
+    }
     for i in 0..=NROOTS {
         b[i] = index_of[lambda[i] as usize];
     }
 
     // --- Berlekamp-Massey ---
-    let mut r: i32 = 0;
-    let mut el: i32 = 0;
+    let mut r: i32 = no_eras as i32;
+    let mut el: i32 = no_eras as i32;
     while r < NROOTS as i32 {
         r += 1;
         let mut discr_r: u8 = 0;
@@ -283,8 +360,8 @@ fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize) -> i32 {
                     t[i + 1] = lambda[i + 1];
                 }
             }
-            if 2 * el < r {
-                el = r - el;
+            if 2 * el < r + no_eras as i32 {
+                el = r + no_eras as i32 - el;
                 for i in 0..=NROOTS {
                     b[i] = if lambda[i] == 0 {
                         A0
@@ -397,7 +474,8 @@ fn decode_rs8(gf: &GfTables, data: &mut [u8], pad: usize) -> i32 {
 // Top-level ASM+Golay frame decode (port of u482c_decode_impl::msg_handler)
 // ---------------------------------------------------------------------------
 
-const HEADER_LEN: usize = 3;
+/// Bytes of Golay(24,12)-coded length/flags header after the syncword.
+pub const HEADER_LEN: usize = 3;
 
 /// Total bytes captured after the syncword for AX100 ASM+Golay framing
 /// (`packlen=258` in gr-satellites' `sync_to_pdu_packed`).
@@ -469,8 +547,8 @@ pub fn ax100_asm_golay_decode(
     let mut packet = frame[HEADER_LEN..HEADER_LEN + frame_len].to_vec();
     ccsds_derandomize(&mut packet);
 
-    let gf = GfTables::new();
-    let count = decode_rs8(&gf, &mut packet, pad);
+    let gf = GfTables::get();
+    let count = decode_rs8(gf, &mut packet, pad, &[]);
     let rs_correctable = count >= 0;
     let rs_corrected_error_count = rs_correctable.then_some(count as u32);
 
@@ -483,6 +561,83 @@ pub fn ax100_asm_golay_decode(
         rs_corrected_error_count,
         rs_correctable,
     })
+}
+
+/// A CRC-verified result of [`ax100_rs_decode_with_erasures`].
+pub struct SoftRsDecoded {
+    /// CSP frame bytes (RS parity stripped); its CRC32C verifies.
+    pub payload: Vec<u8>,
+    /// Codeword symbols RS corrected, erased ones included.
+    pub corrected_symbols: u32,
+    /// The corrected `frame_len`-byte codeword exactly as transmitted
+    /// (CCSDS-scrambled, parity included) — i.e. what the bytes after the
+    /// Golay header should have been, for comparing against a reception.
+    pub codeword_on_air: Vec<u8>,
+}
+
+/// Erasure counts [`ax100_rs_decode_with_erasures`] tries, in order — the
+/// first, 0, being a plain hard-decision decode. Each trades
+/// error-correcting capacity for erasures (`2 * errors + erasures <= 32`),
+/// and which trade-off rescues a given frame depends on how well its soft
+/// values happen to single out the corrupted bytes — so a spread is tried
+/// rather than one value. Capped below 32 so RS itself still has some
+/// power to reject a wrong erasure guess, on top of the CRC32C check.
+pub const SOFT_ERASURE_COUNTS: &[usize] = &[0, 4, 8, 12, 16, 20, 24, 28];
+
+/// Decode the Reed-Solomon stage of an AX100 ASM+Golay frame, erasing the
+/// codeword's least reliable bytes (per `byte_reliability`, one value per
+/// byte of `frame`, higher meaning more trustworthy) in increasingly large
+/// numbers — see [`SOFT_ERASURE_COUNTS`] — until one decodes to a frame
+/// whose CRC verifies.
+///
+/// `frame_len` is the on-wire codeword length from the frame's header (or
+/// a guess at it). Only a decode whose CSP CRC32C trailer verifies is
+/// returned: with erasures, RS alone can be talked into "correcting" to
+/// the wrong codeword, and the CRC is what makes the result trustworthy.
+pub fn ax100_rs_decode_with_erasures(
+    frame: &[u8; ASM_FRAME_LEN_BYTES],
+    frame_len: usize,
+    byte_reliability: &[f32; ASM_FRAME_LEN_BYTES],
+) -> Option<SoftRsDecoded> {
+    if !(NROOTS + 4..=NN).contains(&frame_len) {
+        return None;
+    }
+    let pad = NN - frame_len;
+    let mut derandomized = frame[HEADER_LEN..HEADER_LEN + frame_len].to_vec();
+    ccsds_derandomize(&mut derandomized);
+
+    // Codeword byte indices, least reliable first.
+    let mut order: Vec<usize> = (0..frame_len).collect();
+    order.sort_by(|&a, &b| {
+        byte_reliability[HEADER_LEN + a].total_cmp(&byte_reliability[HEADER_LEN + b])
+    });
+
+    let gf = GfTables::get();
+    let syndromes = rs_syndromes(gf, &derandomized, pad);
+    for &n_erasures in SOFT_ERASURE_COUNTS {
+        let erasures = &order[..n_erasures.min(frame_len)];
+        let mut packet = derandomized.clone();
+        let count = match &syndromes {
+            None => 0,
+            Some(s) => decode_rs8_from_syndromes(gf, &mut packet, pad, erasures, s),
+        };
+        if count < 0 {
+            continue;
+        }
+        let payload = &packet[..frame_len - NROOTS];
+        if csp_crc32c_check(payload) == Some(true) {
+            let payload = payload.to_vec();
+            // The CCSDS scrambler is a plain XOR, so re-applying it turns
+            // the corrected codeword back into what went over the air.
+            ccsds_derandomize(&mut packet);
+            return Some(SoftRsDecoded {
+                payload,
+                corrected_symbols: count as u32,
+                codeword_on_air: packet,
+            });
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -521,24 +676,86 @@ pub fn csp_crc32c_check(frame: &[u8]) -> Option<bool> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Test support: build the on-air AX100 ASM+Golay frame (the
+/// [`ASM_FRAME_LEN_BYTES`] bytes after the syncword) that carries
+/// `payload` — Golay header, then the CCSDS-scrambled RS(255,223) codeword,
+/// zero-padded. A port of `lib/libfec/encode_rs.h` for the fixed CCSDS
+/// parameters, only as far as tests need it.
+#[cfg(test)]
+pub(crate) fn encode_frame_for_test(payload: &[u8]) -> [u8; ASM_FRAME_LEN_BYTES] {
+    let gf = GfTables::get();
+    let (alpha_to, index_of) = (&gf.alpha_to, &gf.index_of);
+    let frame_len = payload.len() + NROOTS;
+    assert!(frame_len <= NN);
+
+    // Generator polynomial, index form.
+    let mut genpoly = [0u8; NROOTS + 1];
+    genpoly[0] = 1;
+    let mut root = FCR * PRIM;
+    for i in 0..NROOTS {
+        genpoly[i + 1] = 1;
+        for j in (1..=i).rev() {
+            genpoly[j] = if genpoly[j] != 0 {
+                genpoly[j - 1]
+                    ^ alpha_to[modnn(index_of[genpoly[j] as usize] as i32 + root) as usize]
+            } else {
+                genpoly[j - 1]
+            };
+        }
+        genpoly[0] = alpha_to[modnn(index_of[genpoly[0] as usize] as i32 + root) as usize];
+        root += PRIM;
+    }
+    for g in genpoly.iter_mut() {
+        *g = index_of[*g as usize];
+    }
+
+    let mut parity = [0u8; NROOTS];
+    for &byte in payload {
+        let feedback = index_of[(byte ^ parity[0]) as usize];
+        if feedback != A0 {
+            for j in 1..NROOTS {
+                parity[j] ^= alpha_to[modnn(feedback as i32 + genpoly[NROOTS - j] as i32) as usize];
+            }
+        }
+        parity.copy_within(1.., 0);
+        parity[NROOTS - 1] = if feedback != A0 {
+            alpha_to[modnn(feedback as i32 + genpoly[0] as i32) as usize]
+        } else {
+            0
+        };
+    }
+
+    let mut codeword = payload.to_vec();
+    codeword.extend_from_slice(&parity);
+    ccsds_derandomize(&mut codeword);
+
+    let header = golay24_encode(frame_len as u32);
+    let mut frame = [0u8; ASM_FRAME_LEN_BYTES];
+    frame[..HEADER_LEN].copy_from_slice(&[(header >> 16) as u8, (header >> 8) as u8, header as u8]);
+    frame[HEADER_LEN..HEADER_LEN + frame_len].copy_from_slice(&codeword);
+    frame
+}
+
+/// Test support: a CSP-shaped payload of `len` bytes (at least 8) with a
+/// valid CRC32C trailer.
+#[cfg(test)]
+pub(crate) fn csp_payload_for_test(len: usize, seed: u8) -> Vec<u8> {
+    let mut payload: Vec<u8> = (0..len - 4)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect();
+    let crc = crc32c::crc32c(&payload);
+    payload.extend_from_slice(&crc.to_be_bytes());
+    payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn golay_encode(data12: u32) -> u32 {
-        let r = data12 & 0xfff;
-        let mut s: u32 = 0;
-        for h in GOLAY_H.iter() {
-            s <<= 1;
-            s |= (h & r).count_ones() & 1;
-        }
-        ((s & 0xfff) << GOLAY_N) | r
-    }
-
     #[test]
     fn test_golay_roundtrip_no_errors() {
         for data in [0u32, 1, 42, 0x123, 0xABC, 0xFFF] {
-            let encoded = golay_encode(data);
+            let encoded = golay24_encode(data);
             let mut w = encoded;
             let errors = golay24_decode(&mut w).expect("should decode cleanly");
             assert_eq!(errors, 0);
@@ -549,7 +766,7 @@ mod tests {
     #[test]
     fn test_golay_corrects_up_to_3_bit_errors() {
         let data = 0x2A5u32;
-        let encoded = golay_encode(data);
+        let encoded = golay24_encode(data);
         for mask in [0b1u32, 0b101, 0b10100001, 1 << 23] {
             let mut corrupted = encoded ^ mask;
             let errors = golay24_decode(&mut corrupted).expect("should correct <=3 bit errors");
@@ -561,7 +778,7 @@ mod tests {
     #[test]
     fn test_golay_rejects_too_many_errors() {
         let data = 0x055u32;
-        let encoded = golay_encode(data);
+        let encoded = golay24_encode(data);
         // Flip 7 widely spread bits - well beyond the 3-bit correction radius.
         let mut corrupted = encoded ^ 0b101_0101_0101_0101_0101;
         assert!(golay24_decode(&mut corrupted).is_err());
@@ -584,7 +801,7 @@ mod tests {
     }
 
     fn make_header(frame_len: u8) -> [u8; HEADER_LEN] {
-        let word = golay_encode(frame_len as u32);
+        let word = golay24_encode(frame_len as u32);
         [(word >> 16) as u8, (word >> 8) as u8, word as u8]
     }
 
@@ -615,6 +832,100 @@ mod tests {
         assert!(decoded.payload.iter().all(|&b| b == 0));
         assert_eq!(decoded.rs_corrected_error_count, Some(0));
         assert!(decoded.rs_correctable);
+    }
+
+    #[test]
+    fn test_decode_rs8_erasures_extend_capacity_past_16_errors() {
+        let gf = GfTables::get();
+        // 24 erased bytes + 4 unflagged errors: 2*4 + 24 = 32, just
+        // correctable, where 28 plain errors are far beyond RS's reach.
+        let erased: Vec<usize> = (0..24).map(|i| i * 9 + 3).collect();
+        let errors = [2usize, 100, 150, 254];
+        let mut data = [0u8; NN];
+        for &i in erased.iter().chain(errors.iter()) {
+            data[i] ^= 0xA5 ^ i as u8;
+        }
+        let mut hard = data;
+        assert_eq!(decode_rs8(gf, &mut hard, 0, &[]), -1);
+
+        assert_eq!(decode_rs8(gf, &mut data, 0, &erased), 28);
+        assert!(data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_decode_rs8_erasures_on_a_shortened_codeword() {
+        let gf = GfTables::get();
+        let pad = 40;
+        let erased: Vec<usize> = (0..20).map(|i| i * 7 + 1).collect();
+        let mut data = vec![0u8; NN - pad];
+        for &i in erased.iter().chain([5usize, 200].iter()) {
+            data[i] ^= 0x3C;
+        }
+        assert_eq!(decode_rs8(gf, &mut data, pad, &erased), 22);
+        assert!(data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_encoded_test_frame_decodes_clean() {
+        let payload = csp_payload_for_test(100, 7);
+        let frame = encode_frame_for_test(&payload);
+        let decoded = ax100_asm_golay_decode(&frame).unwrap();
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.rs_corrected_error_count, Some(0));
+        assert_eq!(csp_crc32c_check(&decoded.payload), Some(true));
+    }
+
+    #[test]
+    fn test_erasures_rescue_a_frame_hard_decisions_cannot() {
+        let payload = csp_payload_for_test(150, 3);
+        let clean = encode_frame_for_test(&payload);
+        let frame_len = payload.len() + NROOTS;
+
+        // 22 corrupted codeword bytes: past RS's 16-error hard limit, but
+        // correctable once the receiver's soft values point them out.
+        let mut frame = clean;
+        let mut byte_reliability = [1.0f32; ASM_FRAME_LEN_BYTES];
+        for k in 0..22 {
+            let idx = HEADER_LEN + 5 + k * 7;
+            frame[idx] ^= 0x41;
+            byte_reliability[idx] = 0.1;
+        }
+        assert!(!ax100_asm_golay_decode(&frame).unwrap().rs_correctable);
+
+        let rescued = ax100_rs_decode_with_erasures(&frame, frame_len, &byte_reliability)
+            .expect("erasures should rescue it");
+        assert_eq!(rescued.payload, payload);
+        assert_eq!(
+            rescued.codeword_on_air,
+            clean[HEADER_LEN..HEADER_LEN + frame_len]
+        );
+    }
+
+    #[test]
+    fn test_erasure_decode_only_returns_crc_verified_frames() {
+        // A valid codeword whose payload's CRC doesn't match: RS is happy,
+        // the CRC isn't, so nothing comes back.
+        let mut payload = csp_payload_for_test(60, 1);
+        let last = payload.len() - 1;
+        payload[last] ^= 1;
+        let frame = encode_frame_for_test(&payload);
+        let reliability = [1.0f32; ASM_FRAME_LEN_BYTES];
+        assert!(
+            ax100_rs_decode_with_erasures(&frame, payload.len() + NROOTS, &reliability).is_none()
+        );
+    }
+
+    #[test]
+    fn test_header_bit_errors_counts_distance_from_a_clean_header() {
+        let payload = csp_payload_for_test(54, 0);
+        let mut frame = encode_frame_for_test(&payload);
+        let frame_len = payload.len() + NROOTS;
+        assert_eq!(header_bit_errors(&frame, frame_len, 0), 0);
+        frame[0] ^= 0b1010_0000;
+        frame[2] ^= 0b0000_0001;
+        assert_eq!(header_bit_errors(&frame, frame_len, 0), 3);
+        // Against a different length the (clean) header is far away.
+        assert!(header_bit_errors(&encode_frame_for_test(&payload), frame_len + 1, 0) >= 8);
     }
 
     #[test]

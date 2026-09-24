@@ -74,17 +74,25 @@ use crate::pfb_taps::PFB_INTERP_TAPS;
 pub struct BitStream {
     /// NRZ bits, MSB first, as recovered by the symbol timing loop.
     pub bits: Vec<bool>,
+    /// The soft symbol value each bit in `bits` was sliced from (same
+    /// index): its sign is the bit, its magnitude how far from the decision
+    /// threshold it landed. Only the relative magnitudes within one frame
+    /// are meaningful — they rank which bits are least reliable, for
+    /// [`crate::fec`]'s erasure decoding.
+    pub soft: Vec<f32>,
     /// Timestamp of each bit in `bits` (same index), in milliseconds from
     /// the start of the input audio file.
     pub bit_times_ms: Vec<f64>,
-    /// Relative signal strength at each bit in `bits` (same index), in dB.
-    /// Measured as the local RMS amplitude (one symbol period wide) of the
+    /// Relative signal power at each bit in `bits` (same index), linear
+    /// (mean square amplitude, not dB — callers average it over a frame
+    /// and take the log once, rather than paying for a log per bit).
+    /// Measured as the local mean square (one symbol period wide) of the
     /// signal *before* AGC normalisation — AGC removes absolute level, so
     /// this is the only point in the chain where the original received
     /// strength is still present. Not calibrated to an absolute RF power;
     /// only meaningful as a relative "louder vs. quieter" comparison
     /// between packets.
-    pub bit_rssi_db: Vec<f64>,
+    pub bit_power: Vec<f64>,
     /// Estimated symbol rate after timing recovery (Hz). Should be ≈ the
     /// nominal baud rate passed in.
     pub recovered_symbol_rate: f64,
@@ -191,7 +199,7 @@ pub fn fm_discriminate_and_filter_multi_bw(
 struct FrontEnd {
     agced: Vec<f32>,
     /// Matched-filtered, DC-blocked signal *before* AGC normalisation —
-    /// kept around only to measure [`BitStream::bit_rssi_db`] from.
+    /// kept around only to measure [`BitStream::bit_power`] from.
     dc_blocked: Vec<f32>,
     fs: f64,
     symbol_rate_hz: f64,
@@ -252,39 +260,40 @@ fn bitstream_from_front_end(front_end: &FrontEnd, clk_bw: f64) -> BitStream {
         .iter()
         .map(|&p| (p - front_end.total_delay_samples) / front_end.fs * 1000.0)
         .collect();
-    let bit_rssi_db: Vec<f64> = sample_positions
+    let bit_power: Vec<f64> = sample_positions
         .iter()
-        .map(|&p| local_rssi_db(&front_end.dc_blocked, p, front_end.sps))
+        .map(|&p| local_power(&front_end.dc_blocked, p, front_end.sps))
         .collect();
 
     BitStream {
         bits,
+        soft: symbols,
         bit_times_ms,
-        bit_rssi_db,
+        bit_power,
         recovered_symbol_rate: recovered_rate,
     }
 }
 
-/// RMS amplitude of `signal` over a one-symbol-period window centred on
-/// `pos` (a fractional sample index), expressed in dB (`20*log10(rms)`).
-/// This is the shared building block behind [`BitStream::bit_rssi_db`] for
-/// both front-ends.
-fn local_rssi_db(signal: &[f32], pos: f64, sps: f64) -> f64 {
+/// Mean square amplitude of `signal` over a one-symbol-period window
+/// centred on `pos` (a fractional sample index), with a tiny floor so its
+/// log is always finite. This is the shared building block behind
+/// [`BitStream::bit_power`] for every front-end.
+fn local_power(signal: &[f32], pos: f64, sps: f64) -> f64 {
     let half_window = (sps / 2.0).max(1.0);
     let lo = ((pos - half_window).floor().max(0.0)) as usize;
     let hi = ((pos + half_window).ceil() as usize).min(signal.len());
     if lo >= hi {
-        // No samples in range (e.g. `pos` right at the signal's edge) — a
-        // finite silence floor, not `-inf`, since this value flows into
-        // JSON output (`serde_json` can't serialize non-finite floats).
-        return -240.0;
+        // No samples in range (e.g. `pos` right at the signal's edge): a
+        // finite silence floor of -240 dB, not zero, since its log flows
+        // into JSON output (`serde_json` can't serialize non-finite floats).
+        return 1e-24;
     }
     let sum_sq: f64 = signal[lo..hi]
         .iter()
         .map(|&x| (x as f64) * (x as f64))
         .sum();
-    let rms = (sum_sq / (hi - lo) as f64).sqrt();
-    20.0 * libm::log10(rms + 1e-12)
+    let rms = (sum_sq / (hi - lo) as f64).sqrt() + 1e-12;
+    rms * rms
 }
 
 // ---------------------------------------------------------------------------
@@ -418,10 +427,16 @@ const PFB_N_FILTERS: usize = 128;
 /// `input`'s bounds read as zero (matching a zero-padded/zero-history
 /// signal, same convention as [`boxcar_matched_filter`]).
 ///
-/// This introduces no net delay: tap column 4 (of 0..7, offsets -4..+3)
-/// is `input[floor(pos)]` at `mu = 0` (row 0 of the table is a unit
-/// impulse there), so the interpolated value at `pos` is referenced
-/// directly against the same timeline `pos` is expressed in.
+/// Tap column `k` weights `input[floor(pos) + 4 - k]` — GNU Radio's FIR
+/// filters convolve (apply their taps time-reversed), and the table is
+/// laid out for that: row 0 (`mu = 0`) is a unit impulse on column 4,
+/// i.e. `input[floor(pos)]`, and row 128 (`mu = 1`) one on column 3, i.e.
+/// `input[floor(pos) + 1]`. (Reading the columns the other way round
+/// interpolates at `floor(pos) - mu` instead, silently mirroring every
+/// fractional sampling phase — it costs several dB of eye opening between
+/// integer sample positions.) This introduces no net delay, so the
+/// interpolated value at `pos` is referenced directly against the same
+/// timeline `pos` is expressed in.
 fn pfb_interpolate(input: &[f32], pos: f64) -> f32 {
     let base = pos.floor();
     let mu = (pos - base) as f32;
@@ -432,7 +447,7 @@ fn pfb_interpolate(input: &[f32], pos: f64) -> f32 {
 
     let mut acc = 0.0f32;
     for (k, &tap) in taps.iter().enumerate() {
-        let idx = base + k as i64 - 4;
+        let idx = base + 4 - k as i64;
         if idx >= 0 && (idx as usize) < input.len() {
             acc += tap * input[idx as usize];
         }
@@ -538,6 +553,173 @@ fn gardner_ted(input: &[f32], fs: f64, symbol_rate: f64, clk_bw: f64) -> (Vec<f3
 }
 
 // ---------------------------------------------------------------------------
+// Alternate front-end: feed-forward (Oerder-Meyr) timing recovery
+// ---------------------------------------------------------------------------
+//
+// A feedback timing loop (the Gardner and Mueller-Müller passes) has to
+// trade acquisition speed against jitter: a bandwidth wide enough to lock
+// onto a short, isolated burst within its preamble also lets the noise on
+// every symbol nudge the clock. On a capture dominated by long runs of
+// back-to-back frames — hundreds in a row during a bulk downlink, with no
+// preamble or carrier gap between them — that jitter is the dominant loss
+// at low SNR: measured on SatNOGS observation 15039753, the loop's soft
+// symbols came out 0.5-1.5 dB worse than the same audio sampled on an
+// ideal clock, which is exactly the margin by which the chain's frames
+// were failing Reed-Solomon.
+//
+// Feed-forward estimation doesn't have that trade-off. Squaring the
+// matched-filter output leaves a spectral line at the symbol rate whose
+// phase is the symbol timing (Oerder & Meyr, 1988). Averaging that line
+// over a long, centred window of `window_symbols` symbols gives a timing
+// estimate with ~1/window_symbols the noise variance of a single symbol's,
+// no loop state to lose between frames, and no settling transient — it
+// sees the whole window at once, before *and* after the symbol. The cost
+// is that it can't follow timing that moves faster than the window, which
+// is why it runs alongside the feedback loops rather than replacing them.
+
+/// Averaging windows (in symbols) tried by
+/// [`fm_discriminate_and_filter_feedforward_multi`]. The long one is what
+/// long back-to-back chains want; the shorter one tracks tighter where the
+/// clock wanders (or where a short burst sits between stretches of noise,
+/// which add variance to a long window's estimate).
+pub const FEEDFORWARD_WINDOW_SYMBOLS: &[usize] = &[64, 512];
+
+/// Run the feed-forward timing front-end described above once per window
+/// length in `windows_symbols`, sharing the matched filter / DC blocker /
+/// AGC stages with each other (the same ones the Gardner passes use).
+pub fn fm_discriminate_and_filter_feedforward_multi(
+    audio: &AudioSamples,
+    symbol_rate_hz: f64,
+    windows_symbols: &[usize],
+) -> Vec<BitStream> {
+    fm_discriminate_and_filter_ensemble(audio, symbol_rate_hz, &[], windows_symbols)
+}
+
+/// [`fm_discriminate_and_filter_multi_bw`] and
+/// [`fm_discriminate_and_filter_feedforward_multi`] in one go, sharing a
+/// single computation of the front-end stages all of them start from.
+/// Returns the Gardner bitstreams (one per entry of `clk_bws`) followed by
+/// the feed-forward ones (one per entry of `ff_windows_symbols`).
+pub fn fm_discriminate_and_filter_ensemble(
+    audio: &AudioSamples,
+    symbol_rate_hz: f64,
+    clk_bws: &[f64],
+    ff_windows_symbols: &[usize],
+) -> Vec<BitStream> {
+    let front_end = FrontEnd::compute(audio, symbol_rate_hz);
+    clk_bws
+        .iter()
+        .map(|&clk_bw| bitstream_from_front_end(&front_end, clk_bw))
+        .chain(
+            ff_windows_symbols
+                .iter()
+                .map(|&w| feedforward_bitstream(&front_end, w)),
+        )
+        .collect()
+}
+
+fn feedforward_bitstream(front_end: &FrontEnd, window_symbols: usize) -> BitStream {
+    let sample_positions = feedforward_strobes(&front_end.agced, front_end.sps, window_symbols);
+    let symbols: Vec<f32> = sample_positions
+        .iter()
+        .map(|&p| pfb_interpolate(&front_end.agced, p))
+        .collect();
+    let bits: Vec<bool> = symbols.iter().map(|&s| s >= 0.0).collect();
+    let bit_times_ms: Vec<f64> = sample_positions
+        .iter()
+        .map(|&p| (p - front_end.total_delay_samples) / front_end.fs * 1000.0)
+        .collect();
+    let bit_power: Vec<f64> = sample_positions
+        .iter()
+        .map(|&p| local_power(&front_end.dc_blocked, p, front_end.sps))
+        .collect();
+    let recovered_symbol_rate = if sample_positions.len() > 1 {
+        let mean_sps = (sample_positions.last().unwrap() - sample_positions[0])
+            / (sample_positions.len() - 1) as f64;
+        front_end.fs / mean_sps
+    } else {
+        front_end.symbol_rate_hz
+    };
+
+    BitStream {
+        bits,
+        soft: symbols,
+        bit_times_ms,
+        bit_power,
+        recovered_symbol_rate,
+    }
+}
+
+/// Symbol strobe positions (fractional sample indices into `signal`) from
+/// Oerder-Meyr square-law timing estimation over a centred moving window.
+///
+/// At each sample `n`, `C[n]` is the window-average of `signal[m]^2 *
+/// exp(-j*2*pi*m/sps)`; for a matched-filtered NRZ signal the squared
+/// envelope peaks at symbol centres, so `-arg(C[n]) * sps / (2*pi)` is
+/// the phase (mod `sps`) of the symbol centres around `n`. Strobes then
+/// step one symbol at a time, each snapping to whichever point on that
+/// local phase grid is nearest a nominal one-symbol step — so a slowly
+/// drifting phase (sample-clock offset, residual Doppler) is followed
+/// without ever having to unwrap it explicitly.
+fn feedforward_strobes(signal: &[f32], sps: f64, window_symbols: usize) -> Vec<f64> {
+    let n = signal.len();
+    let window = ((window_symbols as f64 * sps).round() as usize).max(1);
+    if n < window + 2 * sps.ceil() as usize {
+        return Vec::new();
+    }
+
+    // Prefix sums of signal^2 * exp(-j*2*pi*m/sps), in f64 so the running
+    // sum stays exact enough over a multi-minute capture.
+    let omega = 2.0 * std::f64::consts::PI / sps;
+    let mut prefix_re = Vec::with_capacity(n + 1);
+    let mut prefix_im = Vec::with_capacity(n + 1);
+    let (mut acc_re, mut acc_im) = (0.0f64, 0.0f64);
+    prefix_re.push(0.0);
+    prefix_im.push(0.0);
+    for (m, &x) in signal.iter().enumerate() {
+        let power = (x as f64) * (x as f64);
+        // Reduce the angle modulo one cycle before calling sincos, so the
+        // argument stays small (and the result reproducible) however long
+        // the file is.
+        let cycles = m as f64 / sps;
+        let (s, c) = libm::sincos(omega * sps * (cycles - cycles.floor()));
+        acc_re += power * c;
+        acc_im -= power * s;
+        prefix_re.push(acc_re);
+        prefix_im.push(acc_im);
+    }
+    let half = window / 2;
+    let phase_at = |center: usize| -> f64 {
+        let lo = center.saturating_sub(half);
+        let hi = (center + half + 1).min(n);
+        let re = prefix_re[hi] - prefix_re[lo];
+        let im = prefix_im[hi] - prefix_im[lo];
+        // Symbol-centre phase, in samples, in [0, sps).
+        let tau = -libm::atan2(im, re) / omega;
+        tau.rem_euclid(sps)
+    };
+
+    let mut positions = Vec::with_capacity((n as f64 / sps) as usize);
+    let mut pos = phase_at(0);
+    // Stay clear of the PFB interpolator's 8-tap reach at both ends.
+    while pos < 4.0 {
+        pos += sps;
+    }
+    while pos + 4.0 < n as f64 {
+        positions.push(pos);
+        let nominal = pos + sps;
+        let tau = phase_at(nominal.round() as usize);
+        // Nearest point to `nominal` on the local grid tau + k*sps.
+        let k = ((nominal - tau) / sps).round();
+        let next = tau + k * sps;
+        // Never step backwards or skip a symbol outright, whatever the
+        // phase estimate does across a stretch of pure noise.
+        pos = next.clamp(pos + 0.5 * sps, pos + 1.5 * sps);
+    }
+    positions
+}
+
+// ---------------------------------------------------------------------------
 // Alternate front-end: Mueller-Müller decision-directed timing recovery
 // ---------------------------------------------------------------------------
 //
@@ -620,9 +802,9 @@ pub fn fm_discriminate_and_filter_mueller_muller(
         .iter()
         .map(|&p| (p - total_delay_samples) / fs * 1000.0)
         .collect();
-    let bit_rssi_db: Vec<f64> = sample_positions
+    let bit_power: Vec<f64> = sample_positions
         .iter()
-        .map(|&p| local_rssi_db(&dc_blocked, p, sps))
+        .map(|&p| local_power(&dc_blocked, p, sps))
         .collect();
 
     let recovered_rate = if sample_positions.len() > 1 {
@@ -635,8 +817,9 @@ pub fn fm_discriminate_and_filter_mueller_muller(
 
     BitStream {
         bits,
+        soft: symbols,
         bit_times_ms,
-        bit_rssi_db,
+        bit_power,
         recovered_symbol_rate: recovered_rate,
     }
 }
@@ -731,9 +914,13 @@ mod tests {
     /// `quadrature_demod` block) that swings towards ±`freq_dev` for each
     /// bit. AX100 uses GFSK (Gaussian-filtered FSK, BT≈0.5), so real
     /// captures never have the instant, razor-sharp symbol transitions of
-    /// an ideal square wave — we approximate that Gaussian smoothing here
-    /// with a simple one-pole filter so this fixture is representative of
-    /// what the Gardner timing loop actually has to lock onto.
+    /// an ideal square wave: the NRZ waveform here goes through the same
+    /// BT=0.5 Gaussian filter. Its pulse is symmetric about the symbol
+    /// centre, like the real one — which matters, because both timing
+    /// recovery methods (Gardner's zero crossings, feed-forward's squared
+    /// envelope) lock onto the middle of a symmetric eye, and a lopsided
+    /// stand-in (e.g. a one-pole smoother, which keeps rising until the
+    /// next transition) drags them off it.
     fn make_deviation_audio(
         sample_rate: u32,
         symbol_rate: f64,
@@ -753,15 +940,26 @@ mod tests {
             })
             .collect();
 
-        // One-pole smoothing (~symbol-rate cutoff) to emulate GFSK's
-        // Gaussian pulse shaping.
-        let alpha = 1.0 - libm::expf(-1.0 / (sps as f32));
-        let mut y = 0.0f32;
-        let samples: Vec<f32> = square
-            .iter()
-            .map(|&x| {
-                y += alpha * (x - y);
-                y
+        // Gaussian filter, BT = 0.5: sigma = sqrt(ln 2) / (2*pi*BT) symbols,
+        // truncated at +-2 symbols and normalised to unit DC gain.
+        const BT: f64 = 0.5;
+        let sigma = libm::sqrt(std::f64::consts::LN_2) / (2.0 * std::f64::consts::PI * BT) * sps;
+        let half = (2.0 * sps).ceil() as i64;
+        let taps: Vec<f64> = (-half..=half)
+            .map(|k| libm::exp(-((k * k) as f64) / (2.0 * sigma * sigma)))
+            .collect();
+        let tap_sum: f64 = taps.iter().sum();
+        let samples: Vec<f32> = (0..num_samples as i64)
+            .map(|n| {
+                let acc: f64 = taps
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &t)| {
+                        let idx = (n + k as i64 - half).clamp(0, num_samples as i64 - 1);
+                        t * square[idx as usize] as f64
+                    })
+                    .sum();
+                (acc / tap_sum) as f32
             })
             .collect();
 
@@ -798,6 +996,59 @@ mod tests {
                 (got - input[i]).abs() < 1e-4,
                 "pfb_interpolate at integer position {i} should be ~identity, got {got}, expected {}",
                 input[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_pfb_interpolate_tracks_fractional_positions() {
+        // On a smooth, slowly-varying signal the interpolator must land on
+        // the value *at* `pos`, between its two neighbours and moving the
+        // right way as `mu` grows — not mirrored to `floor(pos) - mu`.
+        let input: Vec<f32> = (0..64).map(|i| libm::sinf(i as f32 * 0.15)).collect();
+        for i in 10..50 {
+            for step in 1..8 {
+                let pos = i as f64 + step as f64 / 8.0;
+                let got = pfb_interpolate(&input, pos);
+                let want = libm::sinf(pos as f32 * 0.15);
+                assert!(
+                    (got - want).abs() < 2e-3,
+                    "pfb_interpolate at {pos}: got {got}, expected {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_feedforward_pipeline_recovers_bits() {
+        let pattern: Vec<bool> = (0..3000u32)
+            .map(|i| i.wrapping_mul(2654435761).rotate_left(13) % 5 < 2)
+            .collect();
+        let audio = make_deviation_audio(48_000, 9600.0, &pattern, 3200.0);
+        for bitstream in
+            fm_discriminate_and_filter_feedforward_multi(&audio, 9600.0, FEEDFORWARD_WINDOW_SYMBOLS)
+        {
+            let got = bitstream.bits.len() as f64 / pattern.len() as f64;
+            assert!(got > 0.95 && got < 1.05, "symbol count ratio {got}");
+            assert_eq!(bitstream.soft.len(), bitstream.bits.len());
+
+            let best = (-300i64..300)
+                .map(|shift| {
+                    let (mut matches, mut compared) = (0, 0);
+                    for (i, &bit) in bitstream.bits.iter().enumerate() {
+                        let j = i as i64 + shift;
+                        if (500..pattern.len() as i64 - 500).contains(&j) {
+                            compared += 1;
+                            matches += usize::from(bit == pattern[j as usize]);
+                        }
+                    }
+                    matches as f64 / compared.max(1) as f64
+                })
+                .fold(0.0, f64::max);
+            assert!(
+                best > 0.99,
+                "feed-forward pass only matched {:.1}%",
+                best * 100.0
             );
         }
     }

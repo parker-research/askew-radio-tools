@@ -7,7 +7,8 @@
 //! Decoded CSP frames are written to stdout as JSONL (one JSON object per
 //! line, fields: data_length_bytes, time_in_file_ms, tier,
 //! sync_bit_errors, golay_corrected_bit_count, header_flags,
-//! rs_corrected_error_count, rs_correctable, crc_pass, rssi_db, data_hex —
+//! rs_corrected_error_count, rs_correctable, crc_pass, combined_copies,
+//! rssi_db, data_hex —
 //! plus filename if `--show-filename` is passed).
 //!
 //! The decoder labels every candidate frame with a `pipeline::FrameTier`

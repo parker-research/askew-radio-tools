@@ -9,10 +9,12 @@
 //!
 //! Row `i` (of 129, for `mu = i/128`) holds the 8 tap weights for
 //! interpolating the sample value at fractional position `base + mu`,
-//! where `base` is the integer sample index and the tap columns correspond
-//! to input offsets `-4, -3, -2, -1, 0, 1, 2, 3` relative to `base`:
-//! `y = Σ taps[i][k] * input[base + k - 4]`. Row 0 (`mu = 0`) is the unit
-//! impulse `[0,0,0,0,1,0,0,0]`, i.e. exactly `input[base]`, as expected.
+//! where `base` is the integer sample index. GNU Radio applies FIR taps as
+//! a convolution (time-reversed), so the tap columns correspond to input
+//! offsets `+4, +3, +2, +1, 0, -1, -2, -3` relative to `base`:
+//! `y = Σ taps[i][k] * input[base + 4 - k]`. Row 0 (`mu = 0`) is the unit
+//! impulse on column 4, i.e. exactly `input[base]`, and row 128 (`mu = 1`)
+//! the unit impulse on column 3, i.e. exactly `input[base + 1]`.
 #[rustfmt::skip]
 pub(crate) const PFB_INTERP_TAPS: [[f32; 8]; 129] = [
     [0.00000e+00, 0.00000e+00, 0.00000e+00, 0.00000e+00, 1.00000e+00, 0.00000e+00, 0.00000e+00, 0.00000e+00],
