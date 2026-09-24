@@ -81,8 +81,15 @@ pub fn find_frames(bits: &[bool], soft: &[f32]) -> Vec<RawFrame> {
     // few bits before a real frame is common enough (threshold=4 over 32
     // bits) that skipping past it would swallow the real frame's syncword
     // before we ever get to test it.
+    // The 32 bits starting at `i`, as a shift register: one bit in per
+    // position instead of re-reading all 32 (same value as
+    // `read_u32_msb(bits, i)`).
+    let mut window = read_u32_msb(bits, 0);
     for i in 0..=(n - 32) {
-        let errors = sync_bit_errors_at(bits, i);
+        if i > 0 {
+            window = (window << 1) | (bits[i + 31] as u32);
+        }
+        let errors = (window ^ SYNC_WORD).count_ones();
 
         if errors <= SYNC_THRESHOLD {
             let payload_start = i + 32;
