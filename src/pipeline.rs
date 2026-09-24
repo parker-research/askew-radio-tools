@@ -666,12 +666,23 @@ impl Collected {
 //
 // The combined decode must then pass RS *and* the CSP CRC32C, and — before
 // the frame is credited to a reception — that reception's own bits have
-// to be within [`MAX_COMBINED_OWN_BIT_DISAGREEMENT`] of the decoded
-// codeword. That last check is what rules out crediting a reception with
-// a *different* frame's content: two distinct RS(255,223) codewords differ
+// to agree with the decoded codeword (see [`own_agreement`]): within
+// [`MAX_COMBINED_OWN_BIT_DISAGREEMENT`] outright, or within
+// [`MAX_NOISY_OWN_BIT_DISAGREEMENT`] if its confidently received bits
+// agree. That check is what rules out crediting a reception with a
+// *different* frame's content: two distinct RS(255,223) codewords differ
 // in at least 33 bytes, which even at the code's minimum distance is ~130
 // bits (every such byte differing in ~4 of its 8 bits) — more than 6.5%
-// of even the longest frame, and far more of a short one.
+// of even the longest frame, and far more of a short one — and a
+// reception carrying the other frame receives those bits as confidently
+// as any others.
+//
+// Measured on the SatNOGS captures of `tests/real_audio.rs`, widening the
+// partner net to [`WIDE_COPY_BIT_DISAGREEMENT`] and crediting noisy copies
+// by their confident bits verifies 53 more frames than a 10% net and a
+// flat 5% credit threshold did (1017 vs 964), every one of the 964 still
+// decoded exactly as before — among them chunk 6 of 15039753's bulk
+// downlink, which no single reception of it had decoded.
 
 /// A reception believed to be real, kept for `combine_retransmissions`.
 struct SoftCopy {
@@ -693,10 +704,52 @@ struct SoftCopy {
 /// look-alike beacons.
 pub const MAX_COPY_BIT_DISAGREEMENT: f64 = 0.10;
 
+/// A wider net for partners, cast only once the copies within
+/// [`MAX_COPY_BIT_DISAGREEMENT`] have failed to decode: two receptions
+/// that are each noisy enough to fail on their own disagree with each
+/// other by roughly the sum of their bit error rates, which at the
+/// margins is well past 10%. Widening this can't admit a wrong frame —
+/// which reception is credited with a combined decode is decided only by
+/// [`own_agreement`] — it just spends more decode attempts.
+pub const WIDE_COPY_BIT_DISAGREEMENT: f64 = 0.20;
+
 /// Largest fraction of its own codeword bits a reception may disagree with
-/// a combined decode on and still be credited with it. See the section
-/// comment above for why this can't admit a different frame's content.
+/// a combined decode on and still be credited with it, however confident
+/// the disagreeing bits were. See the section comment above for why this
+/// can't admit a different frame's content.
 pub const MAX_COMBINED_OWN_BIT_DISAGREEMENT: f64 = 0.05;
+
+/// Past [`MAX_COMBINED_OWN_BIT_DISAGREEMENT`], a reception may still be
+/// credited with a decoded codeword it disagrees with on up to this
+/// fraction of its bits — provided its *confidently received* bits (see
+/// [`CONFIDENT_SOFT_MAGNITUDE`]) disagree on no more than
+/// [`MAX_CONFIDENT_OWN_BIT_DISAGREEMENT`] of them.
+///
+/// This is what tells a noisy copy of a frame from a clean reception of a
+/// *different* one at the same bit distance. Noise flips mostly the bits
+/// it has pushed towards the decision threshold, so a real copy's
+/// disagreements concentrate on its weak bits; a different frame's
+/// content disagrees on whichever bits the two frames differ in, weak or
+/// strong alike. Measured over every reception the ensemble couldn't
+/// decode in the thirteen SatNOGS captures of `tests/real_audio.rs`,
+/// compared against every frame verified in the same file: genuine
+/// retransmissions sat at 5-9% overall but at most 5% on confident bits,
+/// while no *other* frame came within 9.8% on confident bits (the closest
+/// being look-alike beacons, and look-alike bulk-downlink chunks received
+/// cleanly). For scale, two distinct codewords differ in at least 33
+/// bytes (RS's minimum distance), ~6.5% of even a full-length frame's
+/// bits, nearly all of which a clean reception receives confidently.
+pub const MAX_NOISY_OWN_BIT_DISAGREEMENT: f64 = 0.10;
+
+/// See [`MAX_NOISY_OWN_BIT_DISAGREEMENT`].
+pub const MAX_CONFIDENT_OWN_BIT_DISAGREEMENT: f64 = 0.05;
+
+/// Soft symbols whose magnitude, relative to the frame's mean, falls in
+/// this range count as confidently received for
+/// [`MAX_NOISY_OWN_BIT_DISAGREEMENT`]: clear of the decision threshold, but
+/// not so large that they are more likely FM clicks than signal (see
+/// [`framing::bit_reliability`]).
+pub const CONFIDENT_SOFT_MAGNITUDE: std::ops::RangeInclusive<f32> = 0.7..=1.6;
 
 /// `mean(|soft|)^2 / var(|soft|)`: how cleanly the soft symbols separate
 /// from the decision threshold (linear, not dB). Used to weight copies
@@ -779,23 +832,29 @@ fn combine_retransmissions(collected: &mut Collected, filename: &str) {
                     *other,
                 )
             })
-            .filter(|&(disagreement, _)| disagreement <= MAX_COPY_BIT_DISAGREEMENT)
+            .filter(|&(disagreement, _)| disagreement <= WIDE_COPY_BIT_DISAGREEMENT)
             .collect();
         if partners.is_empty() {
             continue;
         }
         partners.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        // All the copies first; if a stray look-alike spoils that, just the
-        // closest one.
-        let partner_sets: Vec<Vec<&SoftCopy>> = if partners.len() > 1 {
-            vec![
-                partners.iter().map(|&(_, p)| p).collect(),
-                vec![partners[0].1],
-            ]
-        } else {
-            vec![vec![partners[0].1]]
-        };
+        // All the close copies first; if a stray look-alike spoils that,
+        // just the closest one; and failing both, everything within the
+        // wider net.
+        let close: Vec<&SoftCopy> = partners
+            .iter()
+            .filter(|&&(disagreement, _)| disagreement <= MAX_COPY_BIT_DISAGREEMENT)
+            .map(|&(_, p)| p)
+            .collect();
+        let mut partner_sets: Vec<Vec<&SoftCopy>> = Vec::new();
+        if close.len() > 1 {
+            partner_sets.push(close.clone());
+        }
+        partner_sets.push(vec![partners[0].1]);
+        if partners.len() > close.len().max(1) {
+            partner_sets.push(partners.iter().map(|&(_, p)| p).collect());
+        }
 
         for partner_set in partner_sets {
             if let Some(result) = decode_combined(target, &partner_set, filename) {
@@ -848,25 +907,7 @@ fn decode_combined(
     let decoded = fec::ax100_rs_decode_with_erasures(&frame, target.frame_len, &byte_reliability)?;
 
     // Credit the frame to `target` only if its own reception matches it.
-    let header_bits = fec::HEADER_LEN * 8;
-    let own = &target.soft[header_bits..];
-    let mut differing_bits = 0usize;
-    let mut differing_bytes = 0u32;
-    for (byte_idx, &on_air) in decoded.codeword_on_air.iter().enumerate() {
-        let mut received = 0u8;
-        for bit in 0..8 {
-            if own[byte_idx * 8 + bit] >= 0.0 {
-                received |= 0x80 >> bit;
-            }
-        }
-        let diff = (received ^ on_air).count_ones() as usize;
-        differing_bits += diff;
-        differing_bytes += u32::from(diff > 0);
-    }
-    if differing_bits as f64 / own.len() as f64 > MAX_COMBINED_OWN_BIT_DISAGREEMENT {
-        return None;
-    }
-
+    let differing_bytes = own_agreement(target, &decoded.codeword_on_air)?;
     let record = PacketRecord {
         filename: filename.to_string(),
         data_length_bytes: decoded.payload.len(),
@@ -883,6 +924,39 @@ fn decode_combined(
         data_hex: hex_encode(&decoded.payload),
     };
     Some((decoded.payload, record))
+}
+
+/// Whether `reception`'s own codeword bits are close enough to
+/// `codeword_on_air` to credit it with that codeword (see
+/// [`MAX_COMBINED_OWN_BIT_DISAGREEMENT`] and
+/// [`MAX_NOISY_OWN_BIT_DISAGREEMENT`]) — and if so, how many of its bytes
+/// differ from it.
+fn own_agreement(reception: &SoftCopy, codeword_on_air: &[u8]) -> Option<u32> {
+    let own = &reception.soft[fec::HEADER_LEN * 8..];
+    let mean_magnitude = framing::mean_soft_magnitude(own);
+    let (mut differing_bits, mut differing_bytes) = (0usize, 0u32);
+    let (mut confident_bits, mut confident_differing_bits) = (0usize, 0usize);
+    for (byte_idx, &on_air) in codeword_on_air.iter().enumerate() {
+        let mut byte_differs = false;
+        for bit in 0..8 {
+            let s = own[byte_idx * 8 + bit];
+            let differs = (s >= 0.0) != ((on_air << bit) & 0x80 != 0);
+            let confident = mean_magnitude > 0.0
+                && CONFIDENT_SOFT_MAGNITUDE.contains(&(s.abs() / mean_magnitude));
+            differing_bits += usize::from(differs);
+            confident_bits += usize::from(confident);
+            confident_differing_bits += usize::from(confident && differs);
+            byte_differs |= differs;
+        }
+        differing_bytes += u32::from(byte_differs);
+    }
+
+    let disagreement = differing_bits as f64 / own.len() as f64;
+    let confident_disagreement = confident_differing_bits as f64 / confident_bits.max(1) as f64;
+    let credited = disagreement <= MAX_COMBINED_OWN_BIT_DISAGREEMENT
+        || (disagreement <= MAX_NOISY_OWN_BIT_DISAGREEMENT
+            && confident_disagreement <= MAX_CONFIDENT_OWN_BIT_DISAGREEMENT);
+    credited.then_some(differing_bytes)
 }
 
 /// Snap a frame's start time to the nearest multiple of two symbol periods
@@ -1090,6 +1164,12 @@ mod tests {
     /// A noisy reception of `payload`'s header + codeword: soft symbols of
     /// magnitude 1, except that one bit in each of the `bad_bytes`
     /// codeword bytes is received weakly with the wrong sign.
+    /// The on-air codeword (after the Golay header) carrying `payload`.
+    fn codeword_on_air(payload: &[u8]) -> Vec<u8> {
+        let frame = fec::encode_frame_for_test(payload);
+        frame[fec::HEADER_LEN..fec::HEADER_LEN + payload.len() + 32].to_vec()
+    }
+
     fn noisy_copy(payload: &[u8], time_in_file_ms: f64, bad_bytes: &[usize]) -> SoftCopy {
         let bits = on_air_bits(payload);
         let mut soft: Vec<f32> = bits[32..]
@@ -1176,6 +1256,72 @@ mod tests {
                 record.time_in_file_ms
             );
         }
+    }
+
+    #[test]
+    fn test_receptions_too_far_apart_for_the_close_net_still_combine() {
+        // Each copy has a weak wrong bit in half its codeword bytes: 6.25%
+        // of its bits, past MAX_COMBINED_OWN_BIT_DISAGREEMENT — and, the
+        // halves being disjoint, 12.5% apart from each other, past
+        // MAX_COPY_BIT_DISAGREEMENT.
+        let payload = fec::csp_payload_for_test(150, 21);
+        let codeword_len = payload.len() + 32;
+        let even: Vec<usize> = (0..codeword_len).step_by(2).collect();
+        let odd: Vec<usize> = (1..codeword_len).step_by(2).collect();
+        let first = noisy_copy(&payload, 1000.0, &even);
+        let second = noisy_copy(&payload, 90000.0, &odd);
+        let header_bits = fec::HEADER_LEN * 8;
+        assert!(
+            sign_disagreement(&first.soft[header_bits..], &second.soft[header_bits..])
+                > MAX_COPY_BIT_DISAGREEMENT
+        );
+
+        let mut collected = Collected::default();
+        collected.copies.push(first);
+        collected.copies.push(second);
+        combine_retransmissions(&mut collected, "t");
+
+        assert_eq!(collected.records.len(), 2);
+        for record in &collected.records {
+            assert_eq!(record.tier, FrameTier::Verified);
+            assert_eq!(record.data_hex, hex_encode(&payload));
+            assert_eq!(record.rs_corrected_error_count, Some(91));
+        }
+    }
+
+    #[test]
+    fn test_own_agreement_credits_weak_disagreements_but_not_confident_ones() {
+        let payload = fec::csp_payload_for_test(150, 22);
+        let codeword = codeword_on_air(&payload);
+        let all_bytes: Vec<usize> = (0..codeword.len()).step_by(2).collect();
+
+        // 6.25% of bits wrong, all of them weakly received: a noisy copy.
+        let weak = noisy_copy(&payload, 0.0, &all_bytes);
+        assert_eq!(own_agreement(&weak, &codeword), Some(91));
+
+        // The same bits wrong, but received as confidently as the rest: a
+        // clean reception of some other frame's content, not this one.
+        let mut confident = noisy_copy(&payload, 0.0, &all_bytes);
+        for s in confident.soft.iter_mut() {
+            *s = s.signum();
+        }
+        assert_eq!(own_agreement(&confident, &codeword), None);
+    }
+
+    #[test]
+    fn test_own_agreement_rejects_a_clean_look_alike_frame() {
+        // Two frames one payload byte apart: the closest distinct
+        // codewords real traffic produces (every parity byte changes).
+        let a = fec::csp_payload_for_test(200, 23);
+        let mut b = a.clone();
+        b[40] ^= 0x01;
+        let crc = crc32c::crc32c(&b[..b.len() - 4]);
+        let n = b.len();
+        b[n - 4..].copy_from_slice(&crc.to_be_bytes());
+
+        let clean_b = noisy_copy(&b, 0.0, &[]);
+        assert!(own_agreement(&clean_b, &codeword_on_air(&b)).is_some());
+        assert_eq!(own_agreement(&clean_b, &codeword_on_air(&a)), None);
     }
 
     #[test]
